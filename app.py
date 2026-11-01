@@ -16,7 +16,7 @@ from watcher import FolderWatcher
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title('EVA | Estação de Vídeo Automatizada')
+        self.title('EVA | ')
         self.geometry('1240x740')
         self.minsize(980, 590)
         self.protocol('WM_DELETE_WINDOW', self.request_close)
@@ -56,7 +56,7 @@ class App(tk.Tk):
         head.pack(fill='x')
         ttk.Label(head, text='EVA', font=('Segoe UI', 24, 'bold'),
                   foreground='#187b8f').pack(side='left', padx=(0, 14))
-        ttk.Label(head, text='Estação de Vídeo Automatizada',
+        ttk.Label(head, text='',
                   font=('Segoe UI', 12, 'bold')).pack(side='left')
         ttk.Label(head, textvariable=self.mode_text,
                   foreground='#405163').pack(side='right')
@@ -80,11 +80,11 @@ class App(tk.Tk):
         self.cut_video_checkbox = ttk.Checkbutton(options, text='corte de vídeo', variable=self.cut_video_var)
         self.cut_video_checkbox.pack(side='left')
         self.path_widgets.append(self.cut_video_checkbox)
-        ttk.Label(options, text='Marcado: corta o vídeo. Desmarcado: mantém o vídeo inteiro e envia os pontos de reprodução no XML.',
+        ttk.Label(options, text='',
                   foreground='#576573', wraplength=840).pack(side='left', padx=(12, 0))
         ttk.Label(paths, textvariable=self.xml_status_text, foreground='#576573',
                   wraplength=1020).grid(row=3, column=1, columnspan=2, sticky='w', pady=(3, 0))
-        ttk.Label(paths, text='A EVA aguarda a cópia terminar, consulta o histórico e processa os vídeos em sequência.',
+        ttk.Label(paths, text='',
                   foreground='#576573').grid(row=4, column=1, columnspan=2, sticky='w', pady=(3, 0))
 
         toolbar = ttk.Frame(self, padding=(12, 4, 12, 10))
