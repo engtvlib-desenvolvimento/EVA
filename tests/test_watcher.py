@@ -1,6 +1,7 @@
 """Exercita a fila com SQLite e arquivos reais, sem substituir testes de FFmpeg."""
 import csv
 import io
+import hashlib
 import os
 import socket
 import sys
@@ -33,7 +34,8 @@ class TestFolderWatcher(unittest.TestCase):
         self.settings.update(source_folder=str(self.source), destination_folder=str(self.dest),
                              local_output_folder=str(self.dest), working_folder=str(self.work),
                              stable_seconds=10, max_attempts=2, retry_delay_sec=0,
-                             watch_interval_sec=1, video_profile='teste')
+                             watch_interval_sec=1, video_profile='teste',
+                             delivery_retention_policy='require_present')
         self.now = 1000.0
         self.clock_patch = patch.object(watcher.time, 'monotonic', side_effect=lambda: self.now)
         self.clock_patch.start()
@@ -133,6 +135,251 @@ class TestFolderWatcher(unittest.TestCase):
                                                 (first_id,)).fetchone()[0], 2)
             self.assertEqual(db.execute('SELECT COUNT(*) FROM delivery_events WHERE job_id=?',
                                         (first_id,)).fetchone()[0], 2)
+
+    def test_handoff_does_not_resend_after_both_files_are_consumed(self):
+        self.video()
+        self.stable_scan(self.new_service(delivery_retention_policy='handoff'))
+        for path in self.dest.iterdir():
+            path.unlink()
+        service = self.new_service(delivery_retention_policy='handoff')
+        self.stable_scan(service)
+        self.service.scan_once()
+        self.assertEqual(self.processed.call_count,1)
+        self.assertEqual(core.jobs()[0]['status'],'CONCLUIDO')
+        self.assertIn('Cadastro externo não confirmado',core.jobs()[0]['message'])
+
+    def test_handoff_preserves_verified_remaining_xml_without_resending(self):
+        self.video()
+        self.stable_scan(self.new_service(delivery_retention_policy='handoff'))
+        (self.dest/'spot.mxf').unlink()
+        remaining=self.dest/'spot.xml'
+        expected=remaining.read_bytes()
+        self.stable_scan(self.new_service(delivery_retention_policy='handoff'))
+        self.assertEqual(self.processed.call_count,1)
+        self.assertEqual(remaining.read_bytes(),expected)
+        self.assertEqual(core.jobs()[0]['status'],'CONCLUIDO')
+
+    def test_handoff_does_not_accept_a_changed_remaining_file(self):
+        self.video()
+        self.stable_scan(self.new_service(delivery_retention_policy='handoff'))
+        (self.dest/'spot.mxf').unlink()
+        remaining=self.dest/'spot.xml'
+        remaining.write_bytes(b'<ArquivoDeTerceiro/>')
+        self.stable_scan(self.new_service(delivery_retention_policy='handoff'))
+        self.assertEqual(self.processed.call_count,1)
+        self.assertEqual(remaining.read_bytes(),b'<ArquivoDeTerceiro/>')
+        self.assertEqual(core.jobs()[0]['error_kind'],'CONFLITO')
+
+    def test_handoff_changed_source_is_a_conflict_even_after_files_are_consumed(self):
+        source=self.video()
+        self.stable_scan(self.new_service(delivery_retention_policy='handoff'))
+        for path in self.dest.iterdir():
+            path.unlink()
+        source.write_bytes(b'nova versao com o mesmo identificador')
+        self.stable_scan(self.new_service(delivery_retention_policy='handoff'))
+        self.assertEqual(self.processed.call_count,1)
+        self.assertEqual(core.jobs()[0]['error_kind'],'CONFLITO')
+
+    def test_handoff_does_not_mark_an_unfinished_reservation_as_delivered(self):
+        self.video()
+        original_process=self.process
+        def processing(job_id,callback=lambda *_:None,publish=False,settings=None,automatic=False):
+            if core.get_job(job_id)['attempts']==1:
+                staged=self.work/'spot.mxf'
+                staged_xml=self.work/'spot.xml'
+                staged.write_bytes(b'MXF incompleto antes do envio')
+                staged_xml.write_text('<Material/>',encoding='utf-8')
+                core.record_automatic_delivery(core.get_job(job_id),self.dest,staged,staged_xml,
+                    core.sha256(staged),core.sha256(staged_xml))
+                raise RuntimeError('falha antes de entregar')
+            return original_process(job_id,callback,publish,settings,automatic)
+        self.processed.side_effect=processing
+        service=self.new_service(delivery_retention_policy='handoff')
+        self.stable_scan(service)
+        self.assertEqual(core.jobs()[0]['status'],'ERRO')
+        service.scan_once()
+        self.assertEqual(self.processed.call_count,2)
+        self.assertEqual(core.jobs()[0]['status'],'CONCLUIDO')
+        self.assertTrue((self.dest/'spot.mxf').is_file())
+
+    def interrupted_handoff_publication(self,remaining):
+        self.video()
+        mxf_data=b'MXF final verificado antes de publicar'
+        xml_data=b'<Material/>'
+        def processing(job_id,callback=lambda *_:None,publish=False,settings=None,automatic=False):
+            staged=self.work/'spot.mxf'
+            staged_xml=self.work/'spot.xml'
+            staged.write_bytes(mxf_data)
+            staged_xml.write_bytes(xml_data)
+            core.record_automatic_delivery(core.get_job(job_id),self.dest,staged,staged_xml,
+                core.sha256(staged),core.sha256(staged_xml))
+            with core.db_connection() as db:
+                db.execute('UPDATE automatic_deliveries SET publication_started_at=?',(core.utcnow(),))
+            if remaining>=1:
+                (self.dest/'spot.xml').write_bytes(xml_data)
+            if remaining==2:
+                (self.dest/'spot.mxf').write_bytes(mxf_data)
+            raise RuntimeError('interrupcao depois de iniciar a publicacao')
+        self.processed.side_effect=processing
+        service=self.new_service(delivery_retention_policy='handoff')
+        self.stable_scan(service)
+        self.assertEqual(self.processed.call_count,1)
+        self.assertEqual(core.jobs()[0]['status'],'ERRO')
+        return service,mxf_data,xml_data
+
+    def test_handoff_started_publication_with_no_files_requires_external_confirmation(self):
+        service,_,_=self.interrupted_handoff_publication(0)
+        for _ in range(3):
+            service.scan_once()
+        self.assertEqual(self.processed.call_count,1)
+        job=core.jobs()[0]
+        self.assertEqual(job['error_kind'],'CONFLITO')
+        self.assertIn('Publicação iniciada',job['message'])
+        self.assertIn('confirmação externa necessária',job['message'])
+        with core.db_connection() as db:
+            record=db.execute('SELECT * FROM automatic_deliveries').fetchone()
+            self.assertEqual(record['status'],'RESERVADO')
+            self.assertIsNotNone(record['publication_started_at'])
+
+    def test_handoff_started_publication_preserves_a_verified_remnant(self):
+        service,_,xml_data=self.interrupted_handoff_publication(1)
+        service.scan_once()
+        self.assertEqual(self.processed.call_count,1)
+        self.assertEqual((self.dest/'spot.xml').read_bytes(),xml_data)
+        self.assertEqual(core.jobs()[0]['error_kind'],'CONFLITO')
+        with core.db_connection() as db:
+            self.assertEqual(db.execute('SELECT status FROM automatic_deliveries').fetchone()[0],'RESERVADO')
+
+    def test_handoff_started_publication_with_both_verified_files_is_reconciled(self):
+        service,mxf_data,xml_data=self.interrupted_handoff_publication(2)
+        service.scan_once()
+        self.assertEqual(self.processed.call_count,1)
+        self.assertEqual(core.jobs()[0]['status'],'CONCLUIDO')
+        self.assertEqual((self.dest/'spot.mxf').read_bytes(),mxf_data)
+        self.assertEqual((self.dest/'spot.xml').read_bytes(),xml_data)
+        with core.db_connection() as db:
+            self.assertEqual(db.execute('SELECT status FROM automatic_deliveries').fetchone()[0],'CONCLUIDO')
+
+    def test_cut_mode_is_saved_for_new_job_and_delivery(self):
+        self.video()
+        self.stable_scan(self.new_service(cut_video=False))
+        job=core.jobs()[0]
+        self.assertEqual(job['cut_video'],0)
+        self.assertFalse(self.processed.call_args.kwargs['settings']['cut_video'])
+        with core.db_connection() as db:
+            self.assertEqual(db.execute('SELECT cut_video FROM automatic_deliveries').fetchone()[0],0)
+
+    def test_changing_cut_mode_does_not_reencode_an_existing_delivery(self):
+        self.video()
+        self.stable_scan(self.new_service(cut_video=True))
+        self.stable_scan(self.new_service(cut_video=False))
+        self.assertEqual(self.processed.call_count,1)
+        self.assertEqual(core.jobs()[0]['cut_video'],1)
+
+    def test_failed_processing_retries_once_when_cut_mode_changes(self):
+        self.video()
+        original_process=self.process
+        def processing(job_id,callback=lambda *_:None,publish=False,settings=None,automatic=False):
+            if settings.get('cut_video',True):
+                raise RuntimeError('falha no processamento com corte')
+            return original_process(job_id,callback,publish,settings,automatic)
+        self.processed.side_effect=processing
+        self.stable_scan(self.new_service(cut_video=True,max_attempts=1))
+        self.assertEqual(core.jobs()[0]['status'],'ERRO')
+        self.assertEqual(self.processed.call_count,1)
+        service=self.new_service(cut_video=False,max_attempts=1)
+        self.stable_scan(service)
+        service.scan_once()
+        self.assertEqual(self.processed.call_count,2)
+        self.assertEqual(core.jobs()[0]['status'],'CONCLUIDO')
+        self.assertEqual(core.jobs()[0]['cut_video'],0)
+
+    def test_identity_conflict_under_another_filename_is_not_retried_indefinitely(self):
+        self.video('P0320866_primeiro.mxf')
+        self.video('P0320866_segundo.mxf')
+        original_process=self.process
+        def processing(job_id,callback=lambda *_:None,publish=False,settings=None,automatic=False):
+            if Path(core.get_job(job_id)['source_path']).stem.endswith('_segundo'):
+                raise core.MaterialIdentityConflict('CM/IDK7 reservado por outro nome de arquivo')
+            return original_process(job_id,callback,publish,settings,automatic)
+        self.processed.side_effect=processing
+        self.stable_scan()
+        self.assertEqual(self.processed.call_count,2)
+        for _ in range(3):
+            self.service.scan_once()
+        with patch.object(core,'ANALYSIS_REVISION','revisao_diferente'):
+            self.stable_scan(self.new_service(cut_video=False))
+        self.assertEqual(self.processed.call_count,2)
+        by_name={Path(job['source_path']).stem:job for job in core.jobs()}
+        self.assertEqual(by_name['P0320866_segundo']['error_kind'],'IDENTIFICADOR')
+        self.assertEqual(by_name['P0320866_primeiro']['status'],'CONCLUIDO')
+        self.assertFalse((self.dest/'P0320866_segundo.mxf').exists())
+
+    def test_checksum_cache_is_released_when_source_leaves_the_watched_tree(self):
+        source=self.video()
+        self.stable_scan()
+        self.service.scan_once()
+        self.assertEqual(len(self.service.verified),2)
+        source.unlink()
+        self.service.scan_once()
+        self.assertEqual(self.service.verified,{})
+
+    def test_idle_scan_of_thousand_delivered_files_uses_one_database_snapshot(self):
+        count=1000
+        mxf_data=b'MXF volume'
+        xml_data=b'<Material/>'
+        mxf_hash=hashlib.sha256(mxf_data).hexdigest()
+        xml_hash=hashlib.sha256(xml_data).hexdigest()
+        job_rows=[]
+        delivery_rows=[]
+        destination=str(self.service.dest)
+        for index in range(count):
+            name=f'volume_{index:04d}'
+            source=self.source/(name+'.mxf')
+            source.write_bytes(b'original')
+            stat=source.stat()
+            output=(self.dest/(name+'.mxf')).resolve()
+            xml=(self.dest/(name+'.xml')).resolve()
+            output.write_bytes(mxf_data)
+            xml.write_bytes(xml_data)
+            job_rows.append((str(source.resolve()),stat.st_size,stat.st_mtime_ns,name,
+                core.utcnow(),core.utcnow(),destination,str(output),str(xml),mxf_hash,xml_hash))
+            delivery_rows.append((name,core.destination_key(self.dest),index+1,stat.st_size,stat.st_mtime_ns,
+                str(output),str(xml),mxf_hash,xml_hash,len(mxf_data),len(xml_data),core.utcnow()))
+        with core.db_connection() as db:
+            db.executemany('''INSERT INTO jobs
+                (source_path,source_size,source_mtime_ns,media_key,status,created_at,updated_at,destination_folder,
+                 output_path,xml_path,output_sha256,xml_sha256) VALUES(?,?,?,?,'CONCLUIDO',?,?,?,?,?,?,?)''',job_rows)
+            db.executemany('''INSERT INTO automatic_deliveries
+                (media_key,destination_key,job_id,source_size,source_mtime_ns,output_path,xml_path,
+                 output_sha256,xml_sha256,delivered_mxf_bytes,delivered_xml_bytes,status,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,'CONCLUIDO',?)''',delivery_rows)
+        service=self.new_service(stable_seconds=0)
+        connection=core.db_connection
+        with patch.object(core,'db_connection',wraps=connection) as connections:
+            service.scan_once()
+            self.assertEqual(connections.call_count,1)
+        with patch.object(core,'db_connection',wraps=connection) as connections, \
+             patch.object(core,'sha256',side_effect=AssertionError('Hash imutavel nao deve ser relido')), \
+             patch.object(core,'matching_files',side_effect=AssertionError('Destino nao deve ser varrido por arquivo')):
+            service.scan_once()
+            self.assertEqual(connections.call_count,1)
+        self.assertEqual(self.processed.call_count,0)
+        self.assertEqual(self.analyzed.call_count,0)
+
+    def test_stop_during_source_enumeration_does_not_materialize_entire_tree(self):
+        source=self.video()
+        visited=[]
+        def sources():
+            for index in range(10000):
+                visited.append(index)
+                if index==3:
+                    self.service.stop_event.set()
+                yield source
+        with patch.object(self.service,'_sources',side_effect=sources):
+            self.service.scan_once()
+        self.assertEqual(len(visited),4)
+        self.assertEqual(self.analyzed.call_count,0)
 
     def test_new_destination_has_independent_delivery(self):
         self.video()
@@ -261,6 +508,48 @@ class TestFolderWatcher(unittest.TestCase):
         self.assertEqual(self.processed.call_count, 1)
         self.assertTrue((self.dest / 'a_primeiro.mxf').exists())
         self.assertFalse((self.dest / 'b_segundo.mxf').exists())
+
+    def test_scan_budget_processes_one_and_registers_remaining_stable_jobs(self):
+        self.video('a_primeiro.mxf')
+        self.video('b_segundo.mxf')
+        service=self.new_service(max_jobs_per_scan=1)
+        self.stable_scan(service)
+        self.assertEqual(self.processed.call_count,1)
+        states={Path(job['source_path']).stem:job['status'] for job in core.jobs()}
+        self.assertEqual(states,{'a_primeiro':'CONCLUIDO','b_segundo':'NOVO'})
+        self.assertTrue((self.dest/'a_primeiro.mxf').is_file())
+        self.assertFalse((self.dest/'b_segundo.mxf').exists())
+
+    def test_new_arrival_is_observed_between_batches_without_bypassing_fifo(self):
+        self.video('b_primeiro.mxf')
+        self.video('c_segundo.mxf')
+        service=self.new_service(max_jobs_per_scan=1,stable_seconds=0)
+        service.scan_once()
+        self.assertEqual(self.processed.call_count,1)
+        self.video('a_novo.mxf')
+        service.scan_once()
+        self.assertEqual(self.processed.call_count,2)
+        states={Path(job['source_path']).stem:job['status'] for job in core.jobs()}
+        self.assertEqual(states['c_segundo'],'CONCLUIDO')
+        self.assertEqual(states['a_novo'],'NOVO')
+        service.scan_once()
+        self.assertEqual(self.processed.call_count,3)
+        processed_ids=[call.args[0] for call in self.processed.call_args_list]
+        names=[Path(core.get_job(job_id)['source_path']).stem for job_id in processed_ids]
+        self.assertEqual(names,['b_primeiro','c_segundo','a_novo'])
+        service.scan_once()
+        self.assertEqual(self.processed.call_count,3,'Varreduras seguintes não devem reenviar os mesmos materiais')
+
+    def test_failed_analysis_also_consumes_one_scan_budget_attempt(self):
+        self.video('a_falha.mxf')
+        self.video('b_depois.mxf')
+        self.analyzed.side_effect=self.ambiguous_analysis
+        service=self.new_service(max_jobs_per_scan=1,stable_seconds=0)
+        service.scan_once()
+        self.assertEqual(self.analyzed.call_count,1)
+        self.assertEqual(self.processed.call_count,0)
+        states={Path(job['source_path']).stem:job['status'] for job in core.jobs()}
+        self.assertEqual(states,{'a_falha':'ERRO','b_depois':'NOVO'})
 
     def test_external_name_conflict_is_preserved_and_not_processed(self):
         self.video()
@@ -508,6 +797,11 @@ class TestWatchConfiguration(unittest.TestCase):
         with self.assertRaises(ValueError):
             core.validate_watch_settings(self.settings)
         self.settings['audio_layout_homologated'] = True
+        with self.assertRaises(ValueError):
+            core.validate_watch_settings(self.settings)
+        template=self.root/'template_integ.xml'
+        template.write_text('<Import><CM>{{CM}}</CM><ID>{{IDK7}}</ID><Arquivo>{{FILENAME}}</Arquivo></Import>',encoding='utf-8')
+        self.settings.update(xml_profile='smartware_template',smartware_xml_template_cut=str(template))
         checked = core.validate_watch_settings(self.settings)
         self.assertEqual(Path(checked['destination_folder']), Path(self.settings['destination_folder']).resolve())
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -20,17 +21,24 @@ class App(tk.Tk):
         self.minsize(980, 590)
         self.protocol('WM_DELETE_WINDOW', self.request_close)
         self.events = queue.Queue()
+        self.refresh_queue_lock = threading.Lock()
+        self.refresh_queued = False
         self.stop_event = threading.Event()
         self.worker = None
         self.export_worker = None
         self.busy = False
         self.closing = False
         self.job_progress = {}
+        self.current_job_id = None
+        self.refresh_pending = False
+        self.last_refresh = 0.0
         core.init_db()
         self.settings = core.config()
         self.source_dir = tk.StringVar(value=self.settings.get('source_folder', ''))
         self.destination_dir = tk.StringVar(value=self.settings.get(
             'destination_folder', self.settings.get('local_output_folder', '')))
+        self.cut_video_var = tk.BooleanVar(value=self.settings.get('cut_video', True))
+        self.xml_status_text = tk.StringVar(value=self.xml_profile_message(self.settings))
         self.status_text = tk.StringVar(value='Selecione a origem e o destino e inicie o monitoramento.')
         self.counts_text = tk.StringVar()
         self.mode_text = tk.StringVar(value='Monitoramento parado')
@@ -67,8 +75,17 @@ class App(tk.Tk):
                                 command=lambda v=variable, t=title: self.pick_folder(v, t))
             button.grid(row=row, column=2, padx=(8, 0), pady=4)
             self.path_widgets.extend((entry, button))
+        options = ttk.Frame(paths)
+        options.grid(row=2, column=1, columnspan=2, sticky='ew', pady=(5, 1))
+        self.cut_video_checkbox = ttk.Checkbutton(options, text='corte de vídeo', variable=self.cut_video_var)
+        self.cut_video_checkbox.pack(side='left')
+        self.path_widgets.append(self.cut_video_checkbox)
+        ttk.Label(options, text='Marcado: corta o vídeo. Desmarcado: mantém o vídeo inteiro e envia os pontos de reprodução no XML.',
+                  foreground='#576573', wraplength=840).pack(side='left', padx=(12, 0))
+        ttk.Label(paths, textvariable=self.xml_status_text, foreground='#576573',
+                  wraplength=1020).grid(row=3, column=1, columnspan=2, sticky='w', pady=(3, 0))
         ttk.Label(paths, text='A EVA aguarda a cópia terminar, consulta o histórico e processa os vídeos em sequência.',
-                  foreground='#576573').grid(row=2, column=1, columnspan=2, sticky='w', pady=(3, 0))
+                  foreground='#576573').grid(row=4, column=1, columnspan=2, sticky='w', pady=(3, 0))
 
         toolbar = ttk.Frame(self, padding=(12, 4, 12, 10))
         toolbar.pack(fill='x')
@@ -108,7 +125,8 @@ class App(tk.Tk):
 
         bottom = ttk.Frame(self, padding=(12, 0, 12, 12))
         bottom.pack(fill='x')
-        ttk.Label(bottom, textvariable=self.counts_text, foreground='#405163').pack(anchor='w', pady=(0, 6))
+        ttk.Label(bottom, textvariable=self.counts_text, foreground='#405163',
+                  wraplength=1150).pack(anchor='w', pady=(0, 6))
         ttk.Progressbar(bottom, variable=self.progress_var, maximum=100).pack(fill='x')
         ttk.Label(bottom, textvariable=self.status_text, foreground='#405163',
                   wraplength=1150).pack(anchor='w', pady=(5, 0))
@@ -119,6 +137,12 @@ class App(tk.Tk):
         self.details = tk.Text(details, height=4, wrap='word', state='disabled',
                                font=('Segoe UI', 9), relief='flat')
         self.details.pack(fill='x')
+
+    @staticmethod
+    def xml_profile_message(settings):
+        if settings.get('xml_profile', 'eva') == 'smartware_template':
+            return 'XML configurado por template do importador.'
+        return 'XML de conferência: cadastro no Smartware ainda não configurado.'
 
     @staticmethod
     def pick_folder(variable, title):
@@ -140,6 +164,7 @@ class App(tk.Tk):
         settings = dict(self.settings)
         settings['source_folder'] = self.source_dir.get().strip()
         settings['destination_folder'] = self.destination_dir.get().strip()
+        settings['cut_video'] = bool(self.cut_video_var.get())
         self.stop_event.clear()
         self.error_text.set('')
         self.progress_var.set(0)
@@ -169,16 +194,24 @@ class App(tk.Tk):
         self.worker.start()
 
     def notify(self, event_type, payload):
+        if event_type == 'refresh':
+            with self.refresh_queue_lock:
+                if self.refresh_queued:
+                    return
+                self.refresh_queued = True
+                self.events.put((event_type, payload))
+            return
         self.events.put((event_type, payload))
 
     def consume_events(self):
-        need_refresh = False
+        force_refresh = False
         try:
             # Limita o trabalho por ciclo para manter a janela responsiva.
             for _ in range(400):
                 typ, payload = self.events.get_nowait()
                 if typ == 'progress':
                     job_id = payload['job_id']
+                    self.current_job_id = job_id
                     progress = max(0.0, min(1.0, float(payload['progress'])))
                     self.job_progress[job_id] = progress
                     self.progress_var.set(progress * 100)
@@ -188,20 +221,25 @@ class App(tk.Tk):
                 elif typ == 'message':
                     self.status_text.set(str(payload))
                 elif typ == 'refresh':
-                    need_refresh = True
+                    with self.refresh_queue_lock:
+                        self.refresh_queued = False
+                    self.refresh_pending = True
                 elif typ == 'error':
                     self.error_text.set('Última falha: ' + str(payload))
                     self.status_text.set('Falha registrada. Consulte a tabela e os logs exportados.')
-                    need_refresh = True
+                    self.refresh_pending = True
                 elif typ == 'settings':
                     self.settings = payload
                     self.source_dir.set(payload['source_folder'])
                     self.destination_dir.set(payload['destination_folder'])
+                    self.cut_video_var.set(payload.get('cut_video', True))
+                    self.xml_status_text.set(self.xml_profile_message(payload))
                 elif typ in ('done', 'stopped'):
                     self.set_running(False)
                     if not self.error_text.get():
                         self.status_text.set('Monitoramento encerrado. O histórico foi preservado.')
-                    need_refresh = True
+                    self.refresh_pending = True
+                    force_refresh = True
                 elif typ == 'exported':
                     self.export_button.configure(state='normal' if not self.closing else 'disabled')
                     self.status_text.set('Logs exportados: ' + str(payload))
@@ -210,22 +248,39 @@ class App(tk.Tk):
                     self.error_text.set('Falha ao exportar logs: ' + str(payload))
         except queue.Empty:
             pass
-        if need_refresh:
+        if self.refresh_pending and (force_refresh or time.monotonic() - self.last_refresh >= 1.0):
             self.refresh()
+            self.refresh_pending = False
         if self.closing and not self.threads_running():
             self.destroy()
             return
         self.after(200, self.consume_events)
 
     def refresh(self):
-        rows = core.jobs()
+        try:
+            limit = max(50, min(5000, int(self.settings.get('ui_history_limit', 500))))
+        except (TypeError, ValueError):
+            limit = 500
+        rows = core.jobs(limit=limit)
+        counts = core.job_counts()
+        visible_ids = {job['id'] for job in rows}
+        # O material atual pode ser mais antigo do que a janela do histórico.
+        if self.current_job_id is not None and self.current_job_id not in visible_ids:
+            try:
+                current = core.get_job(self.current_job_id)
+            except KeyError:
+                current = None
+            if current and current['status'] not in ('CONCLUIDO', 'PREPARADO', 'DUPLICADO', 'ERRO'):
+                rows = [current, *rows[:limit-1]]
+        visible_ids = {job['id'] for job in rows}
+        self.job_progress = {job_id:progress for job_id,progress in self.job_progress.items()
+                             if job_id in visible_ids}
         existing = set(self.table.get_children())
-        counts = {}
+        old_order = self.table.get_children()
         for position, job in enumerate(rows):
             job_id = job['id']
             iid = str(job_id)
             status = job['status']
-            counts[status] = counts.get(status, 0) + 1
             finished = status in ('CONCLUIDO', 'PREPARADO', 'DUPLICADO')
             persisted_progress = float(job.get('progress', 0.0) or 0.0)
             progress = (1.0 if finished else persisted_progress if status == 'ERRO'
@@ -239,15 +294,21 @@ class App(tk.Tk):
                       f"{job['duration']:.2f}s" if job['duration'] is not None else '—',
                       cut, job['message'])
             if iid in existing:
-                self.table.item(iid, values=values, tags=(tag,))
+                previous = self.table.item(iid)
+                if tuple(map(str, previous['values'])) != tuple(map(str, values)) or tuple(previous['tags']) != (tag,):
+                    self.table.item(iid, values=values, tags=(tag,))
                 existing.remove(iid)
             else:
                 self.table.insert('', 'end', iid=iid, values=values, tags=(tag,))
-            self.table.move(iid, '', position)
+            if position >= len(old_order) or old_order[position] != iid:
+                self.table.move(iid, '', position)
         for iid in existing:
             self.table.delete(iid)
-        self.counts_text.set(' | '.join(f'{status}: {count}' for status, count in sorted(counts.items()))
-                             or 'Nenhum vídeo cadastrado.')
+        total = sum(counts.values())
+        summary = ' | '.join(f'{status}: {count}' for status, count in sorted(counts.items()))
+        self.counts_text.set(f'Exibindo {len(rows)} de {total} vídeos | {summary}' if total
+                             else 'Nenhum vídeo cadastrado.')
+        self.last_refresh = time.monotonic()
         self.selection_changed()
 
     def selection_changed(self, *_):

@@ -1,0 +1,11 @@
+<?xml version='1.0' encoding='utf-8'?>
+<Material schema="EVA-INGEST-DRAFT-1">
+  <CM>P0320866</CM>
+  <IDK7>320866</IDK7>
+  <Arquivo>P0320866_ENCONTRO.mxf</Arquivo>
+  <DuracaoSegundos>39.873166667</DuracaoSegundos>
+  <FPS>30000/1001</FPS>
+  <SHA256>EXEMPLO-NAO-E-HASH-REAL</SHA256>
+  <CorteAplicado>true</CorteAplicado>
+  <CriadoUTC>2026-11-01T20:41:43+00:00</CriadoUTC>
+</Material>

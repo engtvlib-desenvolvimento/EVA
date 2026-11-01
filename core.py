@@ -16,13 +16,15 @@ import tempfile
 import time
 import uuid
 import zipfile
-from io import StringIO
+from io import TextIOWrapper
 from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from media_analysis import scan_video
+from integration_metadata import material_identifiers, validate_xml_settings, write_xml
+from process_runner import run_transcode
 
 HERE = (Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False)
         else Path(__file__).resolve().parent)
@@ -48,6 +50,10 @@ class DuplicateMaterialError(FileExistsError):
     """Um nome de mídia já foi encontrado no histórico ou no destino."""
 
 
+class MaterialIdentityConflict(DuplicateMaterialError):
+    """Outro arquivo já reservou o CM/IDK7 neste destino."""
+
+
 BLACK_RE = re.compile(r'black_start:([\d.]+)\s+black_end:([\d.]+)\s+black_duration:([\d.]+)')
 
 
@@ -61,6 +67,13 @@ def config():
     if len(data['audio_channel_map']) != 16:
         raise ValueError('audio_channel_map deve ter EXATAMENTE 16 canais')
     return data
+
+
+def cut_enabled(settings):
+    value = settings.get('cut_video', True)
+    if not isinstance(value, bool):
+        raise ValueError('cut_video deve ser true ou false no config.json.')
+    return value
 
 
 def analysis_signature(settings):
@@ -117,6 +130,31 @@ def validate_watch_settings(settings):
         result[key] = int(value) if key == 'max_attempts' else value
     if len(result.get('audio_channel_map', [])) != 16:
         raise ValueError('audio_channel_map deve ter EXATAMENTE 16 canais.')
+    result['cut_video'] = cut_enabled(result)
+    limit = result.get('ui_history_limit', 500)
+    if isinstance(limit, bool) or int(limit) != float(limit) or not 50 <= int(limit) <= 5000:
+        raise ValueError('ui_history_limit deve ser um inteiro entre 50 e 5000.')
+    result['ui_history_limit'] = int(limit)
+    batch_limit=result.get('max_jobs_per_scan',10)
+    if isinstance(batch_limit,bool) or int(batch_limit) != float(batch_limit) or not 1 <= int(batch_limit) <= 1000:
+        raise ValueError('max_jobs_per_scan deve ser um inteiro entre 1 e 1000.')
+    result['max_jobs_per_scan']=int(batch_limit)
+    if result.get('delivery_retention_policy', 'require_present') not in ('require_present', 'handoff'):
+        raise ValueError('delivery_retention_policy deve ser require_present ou handoff.')
+    if result.get('publication_order', 'xml_first') not in ('xml_first', 'mxf_first'):
+        raise ValueError('publication_order deve ser xml_first ou mxf_first, conforme o importador.')
+    stall_timeout=float(result.get('ffmpeg_stall_timeout_sec',180))
+    if not math.isfinite(stall_timeout) or stall_timeout < 5:
+        raise ValueError('ffmpeg_stall_timeout_sec deve ser pelo menos 5 segundos.')
+    result['ffmpeg_stall_timeout_sec']=stall_timeout
+    analysis_timeout=float(result.get('analysis_timeout_sec',300))
+    if not math.isfinite(analysis_timeout) or analysis_timeout < 5:
+        raise ValueError('analysis_timeout_sec deve ser pelo menos 5 segundos.')
+    result['analysis_timeout_sec']=analysis_timeout
+    validate_xml_settings(result)
+    if result.get('floripa_folder') and destination == Path(result['floripa_folder']).expanduser().resolve():
+        if result.get('xml_profile', 'eva') != 'smartware_template':
+            raise ValueError('A pasta Floripa exige XML de integração real configurado; o XML EVA não é um contrato Smartware.')
     missing = [name for name in ('ffmpeg', 'ffprobe') if not shutil.which(name)]
     if missing:
         raise FileNotFoundError('Instale FFmpeg e FFprobe no PATH. Não encontrado: ' + ', '.join(missing))
@@ -135,10 +173,14 @@ class ClosingConnection(sqlite3.Connection):
 
 def db_connection():
     conn = sqlite3.connect(DB_FILE, timeout=30, factory=ClosingConnection)
-    conn.row_factory = sqlite3.Row
-    conn.execute('PRAGMA journal_mode=WAL')
-    conn.execute('PRAGMA busy_timeout=30000')
-    return conn
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA busy_timeout=30000')
+        return conn
+    except Exception:
+        conn.close()
+        raise
 
 
 def media_key(path):
@@ -246,12 +288,36 @@ def init_db():
             'destination_folder': 'TEXT', 'attempts': 'INTEGER NOT NULL DEFAULT 0',
             'next_retry_at': 'REAL NOT NULL DEFAULT 0', 'error_kind': 'TEXT',
             'progress': 'REAL NOT NULL DEFAULT 0', 'analysis_signature': 'TEXT',
-            'black_intervals_json': 'TEXT', 'slate_intervals_json': 'TEXT'
+            'black_intervals_json': 'TEXT', 'slate_intervals_json': 'TEXT',
+            'cut_video': 'INTEGER NOT NULL DEFAULT 1', 'cm': 'TEXT', 'idk7': 'TEXT',
+            'output_duration': 'REAL'
         }
         for name, datatype in additions.items():
             if name not in columns:
                 db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {datatype}')
+        for table in ('automatic_deliveries', 'delivery_events'):
+            available = {row['name'] for row in db.execute(f'PRAGMA table_info({table})')}
+            for name,datatype in {'cut_video':'INTEGER NOT NULL DEFAULT 1','cm':'TEXT','idk7':'TEXT'}.items():
+                if name not in available:
+                    db.execute(f'ALTER TABLE {table} ADD COLUMN {name} {datatype}')
+        available = {row['name'] for row in db.execute('PRAGMA table_info(automatic_deliveries)')}
+        if 'publication_started_at' not in available:
+            db.execute('ALTER TABLE automatic_deliveries ADD COLUMN publication_started_at TEXT')
         db.execute('CREATE INDEX IF NOT EXISTS ix_jobs_media_key ON jobs(media_key)')
+        db.execute('CREATE INDEX IF NOT EXISTS ix_jobs_destination ON jobs(destination_folder)')
+        db.execute('CREATE INDEX IF NOT EXISTS ix_auto_destination ON automatic_deliveries(destination_key)')
+        db.execute('CREATE INDEX IF NOT EXISTS ix_auto_cm ON automatic_deliveries(destination_key,cm)')
+        db.execute('CREATE INDEX IF NOT EXISTS ix_auto_idk7 ON automatic_deliveries(destination_key,idk7)')
+        # Completa apenas identidades ausentes, sem alterar os nomes/chaves do histórico.
+        for row in db.execute('SELECT id,source_path FROM jobs WHERE cm IS NULL').fetchall():
+            cm,idk7 = material_identifiers(row['source_path'])
+            if cm:
+                db.execute('UPDATE jobs SET cm=?,idk7=? WHERE id=?',(cm,idk7,row['id']))
+        for row in db.execute('SELECT media_key,destination_key,output_path FROM automatic_deliveries WHERE cm IS NULL').fetchall():
+            cm,idk7 = material_identifiers(row['output_path'])
+            if cm:
+                db.execute('UPDATE automatic_deliveries SET cm=?,idk7=? WHERE media_key=? AND destination_key=?',
+                           (cm,idk7,row['media_key'],row['destination_key']))
         for row in db.execute('SELECT id,source_path FROM jobs WHERE media_key IS NULL').fetchall():
             db.execute('UPDATE jobs SET media_key=? WHERE id=?', (media_key(row['source_path']),row['id']))
         # Materiais já concluídos em bancos v0.1 também bloqueiam reenvios.
@@ -340,9 +406,20 @@ def event(job_id, status, message='', **kwargs):
                    (job_id, utcnow(), status, str(message)))
 
 
-def jobs():
+def jobs(limit=None, offset=0):
     with db_connection() as db:
-        return [dict(row) for row in db.execute('SELECT * FROM jobs ORDER BY id DESC')]
+        if limit is None:
+            cursor = db.execute('SELECT * FROM jobs ORDER BY id DESC')
+        else:
+            if int(limit) < 1 or int(offset) < 0:
+                raise ValueError('Limite/offset de histórico inválidos')
+            cursor = db.execute('SELECT * FROM jobs ORDER BY id DESC LIMIT ? OFFSET ?', (int(limit),int(offset)))
+        return [dict(row) for row in cursor]
+
+
+def job_counts():
+    with db_connection() as db:
+        return {row['status']:row['amount'] for row in db.execute('SELECT status,COUNT(*) AS amount FROM jobs GROUP BY status')}
 
 
 def get_job(job_id):
@@ -681,25 +758,10 @@ def sha256(path, callback=None):
     return digest.hexdigest()
 
 
-def xml_for_job(job, output_probe, digest, xml_path):
-    """EXEMPLO, não é o XSD do SmartWare. Ajustar com um XML real da emissora."""
-    root = ET.Element('Material', {'schema': 'EXEMPLO-NAO-FLORIPA'})
-    values = {
-        'Codigo': Path(job['source_path']).stem,
-        'Arquivo': Path(job['source_path']).stem + '.mxf',
-        'DuracaoSegundos': f"{duration_from_probe(output_probe):.3f}",
-        'MarkInOrigemSegundos': f"{job['mark_in']:.3f}",
-        'MarkOutOrigemSegundos': f"{job['mark_out']:.3f}",
-        'VideoCodec': next(s['codec_name'] for s in output_probe['streams'] if s['codec_type']=='video'),
-        'AudioStreams': str(len([s for s in output_probe['streams'] if s['codec_type']=='audio'])),
-        'SHA256': digest,
-        'CriadoUTC': utcnow()
-    }
-    for key,value in values.items():
-        ET.SubElement(root,key).text = str(value)
-    tree = ET.ElementTree(root)
-    ET.indent(tree, space='  ')
-    tree.write(xml_path, encoding='utf-8', xml_declaration=True)
+def xml_for_job(job, output_probe, digest, xml_path, settings=None):
+    """Gera manifesto EVA ou aplica um template real do importador configurado."""
+    settings = dict(settings or config())
+    return write_xml(job, video_duration_from_probe(output_probe), digest, xml_path, settings)
 
 
 def copy_with_hash(src, dst, expected_hash, callback=None):
@@ -733,6 +795,8 @@ def transfer(job, source_mxf, source_xml, settings, digest, callback, dest_overr
     if matching_files(dest,source_mxf.stem):
         raise DuplicateMaterialError(f'Nome já existe na pasta {dest}; envio bloqueado.')
     xml_digest=sha256(source_xml)
+    mxf_bytes,xml_bytes=source_mxf.stat().st_size,source_xml.stat().st_size
+    handoff=settings.get('delivery_retention_policy','require_present')=='handoff'
     if is_floripa:
         claim_publication(job,dest)
     # Lock no compartilhamento impede corrida entre instâncias que executam este programa.
@@ -754,7 +818,17 @@ def transfer(job, source_mxf, source_xml, settings, digest, callback, dest_overr
         copy_with_hash(source_xml,partial_xml,xml_digest,
                        lambda p:callback(.93+.02*p,'Transferindo XML (.part)'))
         ET.parse(partial_xml)
-        # Publicação XML -> MXF solicitada; homologue o gatilho do watch-folder.
+        if handoff:
+            # O importador pode consumir os nomes finais imediatamente.
+            # Confira bytes gravados ANTES de expor o gatilho de ingestão.
+            if (partial_mxf.stat().st_size!=mxf_bytes or partial_xml.stat().st_size!=xml_bytes
+                    or sha256(partial_mxf)!=digest or sha256(partial_xml)!=xml_digest):
+                raise RuntimeError('Integridade dos arquivos .part divergente antes da publicação')
+            with db_connection() as db:
+                db.execute('''UPDATE automatic_deliveries SET publication_started_at=?,updated_at=?
+                    WHERE media_key=? AND destination_key=? AND job_id=? AND status='RESERVADO' ''',
+                    (utcnow(),utcnow(),media_key(job['source_path']),destination_key(dest),job['id']))
+        # A ordem depende de qual nome final dispara a ingestão do importador.
         # Em NTFS (Windows) rename não sobrescreve; em Linux prefira link sem replace.
         def publish_no_replace(src,target):
             if os.name=='nt':
@@ -762,18 +836,27 @@ def transfer(job, source_mxf, source_xml, settings, digest, callback, dest_overr
             else:
                 os.link(src,target)  # hardlink atômico; falha se destino já existe
                 src.unlink()
-        publish_no_replace(partial_xml,final_xml)
-        publish_no_replace(partial_mxf,final_mxf)
-        # Segunda leitura dos arquivos finais: confirma que ambos foram gravados integralmente.
-        if (final_mxf.stat().st_size!=source_mxf.stat().st_size or
-            final_xml.stat().st_size!=source_xml.stat().st_size or
-            sha256(final_mxf)!=digest or sha256(final_xml)!=xml_digest):
-            raise RuntimeError('Integridade pós-publicação divergente (MXF/XML)')
-        ET.parse(final_xml)
-        callback(1.,'MXF e XML finais verificados por SHA-256')
+        order = settings.get('publication_order', 'xml_first')
+        if order not in ('xml_first', 'mxf_first'):
+            raise ValueError('publication_order inválida')
+        pairs = ((partial_xml,final_xml),(partial_mxf,final_mxf))
+        if order == 'mxf_first':
+            pairs = tuple(reversed(pairs))
+        for partial,final in pairs:
+            publish_no_replace(partial,final)
+        if handoff:
+            complete_automatic_delivery(job,dest)
+            callback(1.,'MXF/XML verificados e publicados; confirmação do cadastro depende do importador')
+        else:
+            # Pastas de retenção permitem releitura após publicar os nomes finais.
+            if (final_mxf.stat().st_size!=mxf_bytes or final_xml.stat().st_size!=xml_bytes
+                    or sha256(final_mxf)!=digest or sha256(final_xml)!=xml_digest):
+                raise RuntimeError('Integridade pós-publicação divergente (MXF/XML)')
+            ET.parse(final_xml)
+            callback(1.,'MXF e XML finais verificados por SHA-256')
         if is_floripa:
             finish_publication(job,str(final_mxf),str(final_xml),digest,xml_digest)
-        return str(final_mxf),str(final_xml),xml_digest,final_mxf.stat().st_size,final_xml.stat().st_size
+        return str(final_mxf),str(final_xml),xml_digest,mxf_bytes,xml_bytes
     except Exception:
         # Não remover arquivos FINAIS publicados: evitar duplicidade na próxima tentativa.
         # A reserva fica PENDENTE_REVISAO se existir qualquer arquivo final.
@@ -792,28 +875,48 @@ def destination_key(dest):
     return os.path.normcase(str(Path(dest).expanduser().resolve()))
 
 
+def check_material_identity(job, dest, db=None):
+    """Impede outro nome de arquivo de cadastrar o mesmo CM ou IDK7 no destino."""
+    cm,idk7 = material_identifiers(job['source_path'])
+    if not cm:
+        return
+    def check(connection):
+        row = connection.execute('''SELECT media_key,cm,idk7,job_id FROM automatic_deliveries
+            WHERE destination_key=? AND (cm=? OR idk7=?) AND media_key<>? LIMIT 1''',
+            (destination_key(dest),cm,idk7,media_key(job['source_path']))).fetchone()
+        if row:
+            raise MaterialIdentityConflict(f"CM/IDK7 já entregue ou reservado por outro nome: {row['cm']} / {row['idk7']} (ID {row['job_id']}).")
+    if db is not None:
+        check(db)
+    else:
+        with db_connection() as connection:
+            check(connection)
+
+
 def record_automatic_delivery(job, dest, source_mxf, source_xml, digest, xml_digest):
     """Registra os hashes antes de publicar para reconciliar uma interrupção."""
     with db_connection() as db:
         db.execute('BEGIN IMMEDIATE')
+        check_material_identity(job, dest, db)
         existing = db.execute('SELECT status FROM automatic_deliveries WHERE media_key=? AND destination_key=?',
                               (media_key(job['source_path']), destination_key(dest))).fetchone()
         if existing:
             raise DuplicateMaterialError('Existe entrega registrada neste destino; reconcilie antes de repetir.')
         db.execute('''INSERT INTO automatic_deliveries
             (media_key,destination_key,job_id,source_size,source_mtime_ns,output_path,xml_path,
-             output_sha256,xml_sha256,delivered_mxf_bytes,delivered_xml_bytes,status,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+             output_sha256,xml_sha256,delivered_mxf_bytes,delivered_xml_bytes,status,updated_at,cut_video,cm,idk7)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
             (media_key(job['source_path']), destination_key(dest), job['id'], job['source_size'],
              job['source_mtime_ns'], str(Path(dest) / source_mxf.name), str(Path(dest) / source_xml.name),
-             digest, xml_digest, source_mxf.stat().st_size, source_xml.stat().st_size, 'RESERVADO', utcnow()))
+             digest, xml_digest, source_mxf.stat().st_size, source_xml.stat().st_size, 'RESERVADO', utcnow(),
+             int(job.get('cut_video',1)),*material_identifiers(job['source_path'])))
 
 
 def complete_automatic_delivery(job, dest):
     with db_connection() as db:
         db.execute('''INSERT INTO delivery_events
-            (job_id,moment,media_key,destination_key,status,output_path,xml_path,output_sha256,xml_sha256)
-            SELECT job_id,?,media_key,destination_key,'CONCLUIDO',output_path,xml_path,output_sha256,xml_sha256
+            (job_id,moment,media_key,destination_key,status,output_path,xml_path,output_sha256,xml_sha256,cut_video,cm,idk7)
+            SELECT job_id,?,media_key,destination_key,'CONCLUIDO',output_path,xml_path,output_sha256,xml_sha256,cut_video,cm,idk7
             FROM automatic_deliveries WHERE media_key=? AND destination_key=? AND status!='CONCLUIDO' ''',
                    (utcnow(),media_key(job['source_path']),destination_key(dest)))
         db.execute("UPDATE automatic_deliveries SET status='CONCLUIDO',updated_at=? WHERE media_key=? AND destination_key=?",
@@ -825,11 +928,31 @@ def monitor_event(status, message):
         db.execute('INSERT INTO monitor_events(moment,status,message) VALUES(?,?,?)', (utcnow(),status,str(message)))
 
 
+def ensure_output_capacity(work, destination, length, profile):
+    """Confere espaço com margem para o MXF temporário e a cópia final."""
+    bitrate = 50000000 if profile == 'xdcam_hd422' else 8000000
+    estimated = math.ceil(length * (bitrate/8 + 16*48000*3) * 1.15)
+    margin = 64*1024*1024
+    work_free = shutil.disk_usage(work).free
+    if destination.is_dir():
+        same_volume = work.stat().st_dev == destination.stat().st_dev
+        destination_free = shutil.disk_usage(destination).free
+        required = 2*estimated+margin if same_volume else estimated+margin
+        if destination_free < required:
+            raise OSError(f'Espaço insuficiente no destino para gerar e entregar o MXF; necessário aproximadamente {required//1048576} MiB.')
+    if work_free < estimated+margin:
+        raise OSError(f'Espaço insuficiente na pasta de trabalho; necessário aproximadamente {(estimated+margin)//1048576} MiB.')
+
+
 def process(job_id, callback=lambda x,y:None, publish=False, settings=None, automatic=False):
     job = get_job(job_id)
     if job['status'] != 'APROVADO':
         raise ValueError('Apenas materiais aprovados podem ser processados')
     settings = dict(settings or config())
+    cut_video = cut_enabled(settings)
+    validate_xml_settings(settings)
+    cm,idk7 = material_identifiers(job['source_path'], required=settings.get('xml_profile','eva')=='smartware_template')
+    job.update(cut_video=int(cut_video),cm=cm,idk7=idk7)
     if automatic:
         settings['local_output_folder'] = settings['destination_folder']
         publish = False
@@ -843,6 +966,10 @@ def process(job_id, callback=lambda x,y:None, publish=False, settings=None, auto
         reason,other_id=duplicate_in_history(job)
     if reason:
         reject_duplicate(job_id,reason,other_id)
+    if automatic:
+        if not planned_dest.is_dir():
+            raise NotADirectoryError(f'Destino indisponível antes da codificação: {planned_dest}')
+        check_material_identity(job, planned_dest)
     input_path = Path(job['source_path'])
     stat = input_path.stat()
     if stat.st_size != job['source_size'] or stat.st_mtime_ns != job['source_mtime_ns']:
@@ -854,7 +981,11 @@ def process(job_id, callback=lambda x,y:None, publish=False, settings=None, auto
     # Arquivo original NUNCA é alterado.
     probe = run_probe(input_path)
     video = next(s for s in probe['streams'] if s['codec_type']=='video')
-    length = job['mark_out'] - job['mark_in']
+    source_duration = video_duration_from_probe(probe)
+    length = job['mark_out'] - job['mark_in'] if cut_video else source_duration
+    if not (job['mark_in'] is not None and job['mark_out'] is not None
+            and 0 <= job['mark_in'] < job['mark_out'] <= source_duration+.0001):
+        raise ValueError('Marcas fora do vídeo de origem')
     profile = settings.get('video_profile', 'xdcam_hd422')
     if profile == 'xdcam_hd422':
         if int(video.get('width',0)) != 1920 or int(video.get('height',0)) != 1080:
@@ -864,20 +995,30 @@ def process(job_id, callback=lambda x,y:None, publish=False, settings=None, auto
             raise ValueError('Perfil XDCAM HD422 60i exige 30000/1001 fps.')
         if video.get('field_order') not in ('tt','tb','top','unknown',None):
             raise ValueError(f"Ordem de campo não homologada: {video.get('field_order')}")
-    event(job_id,'PROCESSANDO','Iniciando recorte e tratamento')
+    ensure_output_capacity(work,planned_dest,length,profile)
+    copy_video = not cut_video and video.get('codec_name') == 'mpeg2video' and video.get('pix_fmt') == 'yuv422p'
+    if profile == 'xdcam_hd422':
+        copy_video = copy_video and int(video.get('bit_rate') or 0) == 50000000 and video.get('field_order') == 'tt'
+    mode_message = ('Recortando vídeo e remapeando áudio' if cut_video else
+                    'Preservando vídeo integral e remapeando áudio; marcas serão enviadas no XML')
+    event(job_id,'PROCESSANDO',mode_message,cut_video=int(cut_video),cm=cm,idk7=idk7,output_duration=length)
     stem = input_path.stem
     with tempfile.TemporaryDirectory(prefix='mxf_', dir=work) as tmp:
         local_mxf = Path(tmp) / (stem + '.mxf')
         local_xml = Path(tmp) / (stem + '.xml')
         cmd = ['ffmpeg','-hide_banner','-nostdin','-y','-loglevel','error',
-               '-progress','pipe:1','-stats_period','0.4',
-               '-ss',f"{job['mark_in']:.6f}",'-i',str(input_path),
+               '-progress','pipe:1','-stats_period','0.4']
+        if cut_video:
+            cmd.extend(['-ss',f"{job['mark_in']:.6f}"])
+        cmd.extend(['-i',str(input_path),
                '-t',f'{length:.6f}',
                '-filter_complex',filters_for_audio(probe, settings, length),
-               '-map','0:v:0']
+               '-map','0:v:0'])
         for i in range(16):
             cmd.extend(['-map',f'[a{i}]'])
-        if profile == 'xdcam_hd422':
+        if copy_video:
+            cmd.extend(['-c:v','copy'])
+        elif profile == 'xdcam_hd422':
             cmd.extend(['-c:v','mpeg2video','-b:v','50M','-minrate','50M',
                         '-maxrate','50M','-bufsize','17825792','-pix_fmt','yuv422p',
                         '-flags','+ildct+ilme','-vf','setfield=tff','-field_order','tt','-r','30000/1001',
@@ -889,24 +1030,7 @@ def process(job_id, callback=lambda x,y:None, publish=False, settings=None, auto
             raise ValueError('video_profile inválido')
         cmd.extend(['-c:a','pcm_s24le','-ar','48000','-ac','1',
                     '-f','mxf',str(local_mxf)])
-        with tempfile.TemporaryFile(mode='w+t',encoding='utf-8') as err:
-            with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err,
-                                  text=True, encoding='utf-8', errors='replace',bufsize=1,
-                                  creationflags=SUBPROCESS_FLAGS) as p:
-                for line in p.stdout:
-                    if line.startswith('out_time='):
-                        stamp = line.split('=',1)[1].strip()
-                        if ':' in stamp:
-                            try:
-                                h,m,s = stamp.split(':')
-                                seconds = int(h)*3600 + int(m)*60 + float(s)
-                            except ValueError:
-                                continue
-                            callback(min(.68, .68 * seconds / length),'Codificando MXF')
-                code = p.wait()
-            if code:
-                err.seek(0)
-                raise RuntimeError('ffmpeg falhou: '+err.read()[-4000:])
+        run_transcode(cmd,length,callback,float(settings.get('ffmpeg_stall_timeout_sec',180)))
         event(job_id,'VALIDANDO','Conferindo saída técnica')
         output_probe = run_probe(local_mxf)
         out_video = [s for s in output_probe['streams'] if s['codec_type']=='video']
@@ -936,7 +1060,7 @@ def process(job_id, callback=lambda x,y:None, publish=False, settings=None, auto
             raise RuntimeError('Origem modificada durante o processamento; a saída foi descartada.')
         callback(.70,'Calculando SHA-256')
         digest = sha256(local_mxf, lambda x:callback(.70+.06*x,'Verificando arquivo'))
-        xml_for_job(job, output_probe, digest, local_xml)
+        xml_for_job(job, output_probe, digest, local_xml, settings)
         event(job_id,'TRANSFERINDO','Enviando arquivos .part e verificando SHA-256')
         if publish:
             target_mxf,target_xml,xml_digest,mxf_bytes,xml_bytes = transfer(job,local_mxf,local_xml,settings,digest,callback)
@@ -955,8 +1079,9 @@ def process(job_id, callback=lambda x,y:None, publish=False, settings=None, auto
             if automatic:
                 complete_automatic_delivery(job, local_dest)
             event(job_id,'CONCLUIDO' if automatic else 'PREPARADO',
-                  'MXF e XML entregues e verificados no destino' if automatic else
-                  'MXF e XML de exemplo validados na pasta local — Floripa ainda não recebeu',
+                  ('MXF e XML entregues e verificados; cadastro Smartware não confirmado' if settings.get('xml_profile','eva')=='smartware_template'
+                   else 'MXF e XML EVA entregues e verificados no destino') if automatic else
+                  'MXF e XML preparados na pasta local',
                   output_path=target_mxf,xml_path=target_xml,output_sha256=digest,
                   xml_sha256=xml_digest,
                   delivered_mxf_bytes=mxf_bytes,delivered_xml_bytes=xml_bytes,
@@ -998,31 +1123,41 @@ def publish_prepared(job_id, callback=lambda x,y:None):
 
 
 def export_csv(filepath):
-    rows = jobs()
     columns = ['id','source_path','media_key','duplicate_of','destination_folder','duration','mark_in','mark_out',
                'confidence','status','message','output_path','xml_path','output_sha256',
                'xml_sha256','delivery_verified_at','delivered_mxf_bytes','delivered_xml_bytes',
-               'attempts','error_kind','progress','updated_at']
-    with open(filepath,'w',newline='',encoding='utf-8-sig') as f:
+               'cm','idk7','cut_video','output_duration','attempts','error_kind','progress','updated_at']
+    with db_connection() as db, open(filepath,'w',newline='',encoding='utf-8-sig') as f:
         writer = csv.DictWriter(f,fieldnames=columns,extrasaction='ignore',delimiter=';')
         writer.writeheader()
-        writer.writerows(rows)
+        cursor = db.execute('SELECT * FROM jobs ORDER BY id DESC')
+        for rows in iter(lambda:cursor.fetchmany(1000),[]):
+            writer.writerows(_csv_safe(dict(row)) for row in rows)
+
+
+def _csv_safe(row):
+    return {key: "'" + value if isinstance(value,str) and value.startswith(('=','+','-','@','\t','\r'))
+            else value for key,value in row.items()}
 
 
 def export_logs(filepath):
-    """Snapshot consistente de estados, eventos e entregas para auditoria."""
-    with db_connection() as db:
-        db.execute('BEGIN')
-        tables = {name: [dict(row) for row in db.execute(f'SELECT * FROM {name} ORDER BY rowid')]
-                  for name in ('jobs', 'events', 'automatic_deliveries', 'delivery_events', 'media_transfers', 'monitor_events')}
-        columns = {name: [row['name'] for row in db.execute(f'PRAGMA table_info({name})')]
-                   for name in tables}
-    with zipfile.ZipFile(filepath, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
-        for name, rows in tables.items():
-            buffer = StringIO(newline='')
-            writer = csv.DictWriter(buffer, fieldnames=columns[name], delimiter=';')
-            writer.writeheader()
-            # Evita executar nomes de arquivos/mensagens como fórmulas no Excel.
-            writer.writerows({key: "'" + value if isinstance(value, str) and value.startswith(('=', '+', '-', '@', '\t', '\r'))
-                              else value for key, value in row.items()} for row in rows)
-            archive.writestr(name + '.csv', buffer.getvalue().encode('utf-8-sig'))
+    """Snapshot consistente escrito em blocos, sem carregar o histórico em memória."""
+    target = Path(filepath).expanduser().resolve()
+    if target.suffix.lower() != '.zip':
+        raise ValueError('A exportação de logs deve usar um arquivo .zip.')
+    temporary = target.with_suffix('.'+uuid.uuid4().hex+'.tmp')
+    try:
+        with db_connection() as db, zipfile.ZipFile(temporary,'w',compression=zipfile.ZIP_DEFLATED) as archive:
+            db.execute('BEGIN')
+            for name in ('jobs','events','automatic_deliveries','delivery_events','media_transfers','monitor_events'):
+                columns = [row['name'] for row in db.execute(f'PRAGMA table_info({name})')]
+                with archive.open(name+'.csv','w',force_zip64=True) as raw:
+                    with TextIOWrapper(raw,encoding='utf-8-sig',newline='') as stream:
+                        writer = csv.DictWriter(stream,fieldnames=columns,delimiter=';')
+                        writer.writeheader()
+                        cursor = db.execute(f'SELECT * FROM {name} ORDER BY rowid')
+                        for rows in iter(lambda:cursor.fetchmany(1000),[]):
+                            writer.writerows(_csv_safe(dict(row)) for row in rows)
+        os.replace(temporary,target)
+    finally:
+        temporary.unlink(missing_ok=True)

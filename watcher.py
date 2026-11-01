@@ -4,6 +4,7 @@ from __future__ import annotations
 import ctypes
 import os
 import socket
+import stat as stat_module
 import time
 import uuid
 from pathlib import Path
@@ -75,6 +76,60 @@ class FolderWatcher:
         self.last_progress = {}
         self.source_errors = {}
         self.analysis_signature = core.analysis_signature(self.settings)
+        self._jobs_by_path = None
+        self._jobs_by_key = None
+        self._deliveries = None
+        self._destination_names = None
+        self._validated_parent_pairs = set()
+
+    @staticmethod
+    def _path_key(path):
+        return os.path.normcase(str(path))
+
+    def _load_scan_snapshot(self):
+        """Duas consultas por varredura, em vez de conexões por vídeo conhecido."""
+        prefix = str(self.source).rstrip('\\/') + os.sep
+        escaped_prefix = prefix.replace('!', '!!').replace('%', '!%').replace('_', '!_') + '%'
+        with core.db_connection() as db:
+            rows = db.execute('''SELECT * FROM jobs
+                WHERE source_path LIKE ? ESCAPE '!' OR destination_folder=?''',
+                (escaped_prefix, str(self.dest))).fetchall()
+            deliveries = db.execute('SELECT * FROM automatic_deliveries WHERE destination_key=?',
+                                    (core.destination_key(self.dest),)).fetchall()
+        self._jobs_by_path = {}
+        self._jobs_by_key = {}
+        for row in rows:
+            self._cache_job(dict(row))
+        self._deliveries = {row['media_key']:dict(row) for row in deliveries}
+        self._destination_names = {}
+        with os.scandir(self.dest) as entries:
+            for entry in entries:
+                if self.stop_event.is_set():
+                    break
+                self._destination_names.setdefault(entry.name.casefold(), []).append(entry.name)
+
+    def _cache_job(self, job):
+        if self._jobs_by_path is not None:
+            self._jobs_by_path[self._path_key(job['source_path'])] = job
+            bucket = self._jobs_by_key.setdefault(job['media_key'], {})
+            bucket[job['id']] = job
+        return job
+
+    def _refresh_job(self, job_id):
+        return self._cache_job(core.get_job(job_id))
+
+    def _matching_files(self, stem):
+        if self._destination_names is None:
+            return core.matching_files(self.dest, stem)
+        return [name for extension in ('.mxf', '.xml')
+                for name in self._destination_names.get((stem + extension).casefold(), [])]
+
+    def _remember_output_names(self, job):
+        if self._destination_names is not None:
+            for field in ('output_path', 'xml_path'):
+                if job.get(field):
+                    name = Path(job[field]).name
+                    self._destination_names[name.casefold()] = [name]
 
     def run(self, stop_event):
         self.stop_event = stop_event
@@ -110,18 +165,20 @@ class FolderWatcher:
             raise NotADirectoryError(f'Origem indisponível: {self.source}')
         if not self.dest.is_dir():
             raise NotADirectoryError(f'Destino indisponível: {self.dest}')
-        result = []
         def walk_error(exc):
             self._source_error(exc.filename or self.source, exc)
         for directory, subdirs, filenames in os.walk(self.source, onerror=walk_error, followlinks=False):
+            if self.stop_event.is_set():
+                return
             subdirs[:] = sorted(name for name in subdirs
                                 if not (Path(directory) / name).is_symlink()
                                 and (Path(directory) / name).resolve() not in (self.work, self.dest))
             for name in sorted(filenames):
+                if self.stop_event.is_set():
+                    return
                 path = Path(directory) / name
                 if path.suffix.lower() in core.VIDEO_EXTENSIONS and not path.is_symlink():
-                    result.append(path)
-        return result
+                    yield path
 
     def _source_error(self, path, exc):
         message = f'Falha ao acessar {path}: {exc}'
@@ -132,20 +189,25 @@ class FolderWatcher:
 
     def _register(self, path, stat):
         source_path = str(path)
+        cached = None if self._jobs_by_path is None else self._jobs_by_path.get(self._path_key(source_path))
+        if cached is not None and cached['source_size'] == stat.st_size and cached['source_mtime_ns'] == stat.st_mtime_ns and cached['destination_folder'] == str(self.dest):
+            return cached
         with core.db_connection() as db:
             previous = db.execute('SELECT * FROM jobs WHERE source_path=?', (source_path,)).fetchone()
             if previous is None:
                 # Versões anteriores podem ter guardado caminhos Windows 8.3.
                 for candidate in db.execute('SELECT * FROM jobs WHERE media_key=?', (core.media_key(path),)):
                     if Path(candidate['source_path']).expanduser().resolve() == path.resolve():
-                        previous = candidate
+                        previous = dict(candidate)
+                        previous['source_path'] = source_path
                         db.execute('UPDATE jobs SET source_path=? WHERE id=?', (source_path,previous['id']))
                         break
             if previous is None:
                 cursor = db.execute('''INSERT INTO jobs
-                    (source_path,source_size,source_mtime_ns,media_key,status,created_at,updated_at,destination_folder)
-                    VALUES(?,?,?,?,'NOVO',?,?,?)''',
-                    (source_path,stat.st_size,stat.st_mtime_ns,core.media_key(path),core.utcnow(),core.utcnow(),str(self.dest)))
+                    (source_path,source_size,source_mtime_ns,media_key,status,created_at,updated_at,destination_folder,cut_video)
+                    VALUES(?,?,?,?,'NOVO',?,?,?,?)''',
+                    (source_path,stat.st_size,stat.st_mtime_ns,core.media_key(path),core.utcnow(),core.utcnow(),str(self.dest),
+                     int(bool(self.settings.get('cut_video',True)))))
                 job_id = cursor.lastrowid
                 reason = 'Arquivo estável detectado na pasta de origem.'
             else:
@@ -153,30 +215,41 @@ class FolderWatcher:
                 changed = previous['source_size'] != stat.st_size or previous['source_mtime_ns'] != stat.st_mtime_ns
                 moved = previous['destination_folder'] != str(self.dest)
                 if not changed and not moved:
-                    return dict(previous)
+                    return self._cache_job(dict(previous))
                 if not changed and previous['destination_folder'] is None and previous['output_path'] and Path(previous['output_path']).parent.resolve() == self.dest:
                     db.execute('UPDATE jobs SET destination_folder=? WHERE id=?',(str(self.dest),job_id))
-                    return dict(previous)
+                    updated = dict(previous)
+                    updated['destination_folder'] = str(self.dest)
+                    return self._cache_job(updated)
                 db.execute('''UPDATE jobs SET source_size=?,source_mtime_ns=?,destination_folder=?,
                     attempts=0,next_retry_at=0,error_kind=NULL,duration=NULL,fps=NULL,mark_in=NULL,
                     mark_out=NULL,confidence=NULL,black_intervals_json=NULL,slate_intervals_json=NULL,
                     output_path=NULL,xml_path=NULL,output_sha256=NULL,
                     xml_sha256=NULL,delivery_verified_at=NULL,delivered_mxf_bytes=NULL,
-                    delivered_xml_bytes=NULL,duplicate_of=NULL,progress=0 WHERE id=?''',
-                    (stat.st_size,stat.st_mtime_ns,str(self.dest),job_id))
+                    delivered_xml_bytes=NULL,duplicate_of=NULL,progress=0,cut_video=? WHERE id=?''',
+                    (stat.st_size,stat.st_mtime_ns,str(self.dest),int(bool(self.settings.get('cut_video',True))),job_id))
                 reason = 'Origem alterada; verificando entrega anterior.' if changed else 'Destino alterado; verificando esta pasta.'
         core.event(job_id, 'NOVO', reason)
         self.notify('refresh', None)
-        return core.get_job(job_id)
+        return self._refresh_job(job_id)
 
-    def _delivery(self, job):
+    def _delivery(self, job, refresh=False):
+        key = core.media_key(job['source_path'])
+        if self._deliveries is not None and not refresh:
+            return self._deliveries.get(key)
         with core.db_connection() as db:
             row = db.execute('SELECT * FROM automatic_deliveries WHERE media_key=? AND destination_key=?',
                              (core.media_key(job['source_path']),core.destination_key(self.dest))).fetchone()
-            return dict(row) if row else None
+            delivery = dict(row) if row else None
+        if self._deliveries is not None:
+            if delivery is None:
+                self._deliveries.pop(key, None)
+            else:
+                self._deliveries[key] = delivery
+        return delivery
 
-    def _hash_matches(self, path, digest, size):
-        stat = path.stat()
+    def _hash_matches(self, path, digest, size, stat=None):
+        stat = path.stat() if stat is None else stat
         signature = (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, digest)
         if stat.st_size != size:
             return False
@@ -193,8 +266,10 @@ class FolderWatcher:
         delivery = self._delivery(job)
         stem = Path(job['source_path']).stem
         lock = self.dest / ('.' + core.media_key(job['source_path']) + '.ingest.lock')
-        if lock.exists():
+        if (self._destination_names is None or lock.name.casefold() in self._destination_names) and lock.exists():
             remove_abandoned_lock(lock)
+            if self._destination_names is not None:
+                self._destination_names.pop(lock.name.casefold(), None)
         if delivery is None:
             # Adota resultados locais de versões anteriores somente com hashes conhecidos.
             if job.get('output_path') and job.get('xml_path') and job.get('output_sha256') and job.get('xml_sha256'):
@@ -203,55 +278,79 @@ class FolderWatcher:
                     if core.sha256(mxf) == job['output_sha256'] and core.sha256(xml) == job['xml_sha256']:
                         core.record_automatic_delivery(job, self.dest, mxf, xml, job['output_sha256'], job['xml_sha256'])
                         core.complete_automatic_delivery(job, self.dest)
-                        delivery = self._delivery(job)
+                        delivery = self._delivery(job, refresh=True)
+                        self._remember_output_names(job)
             if delivery is None:
-                found = core.matching_files(self.dest, stem)
+                found = self._matching_files(stem)
                 if found:
                     raise DeliveryConflict('Nome existente sem entrega verificada no banco: ' + ', '.join(found))
                 if job['error_kind'] == 'CONFLITO':
                     core.event(job['id'], 'NOVO', 'Conflito removido do destino; nova tentativa agendada.',
                                error_kind=None,attempts=0,next_retry_at=0.,progress=0.)
+                    self._refresh_job(job['id'])
                 return False
         mxf, xml = Path(delivery['output_path']), Path(delivery['xml_path'])
-        if mxf.parent.resolve() != self.dest or xml.parent.resolve() != self.dest:
-            raise DeliveryConflict('Caminhos do registro de entrega divergem do destino selecionado.')
+        parent_pair = (str(mxf.parent),str(xml.parent))
+        if parent_pair not in self._validated_parent_pairs:
+            if mxf.parent.resolve() != self.dest or xml.parent.resolve() != self.dest:
+                raise DeliveryConflict('Caminhos do registro de entrega divergem do destino selecionado.')
+            self._validated_parent_pairs.add(parent_pair)
         present = []
         for path, digest, size in ((mxf,delivery['output_sha256'],delivery['delivered_mxf_bytes']),
                                     (xml,delivery['xml_sha256'],delivery['delivered_xml_bytes'])):
-            if path.exists():
-                if not path.is_file() or not self._hash_matches(path, digest, size):
-                    raise DeliveryConflict(f'Arquivo no destino difere do histórico; preservado: {path.name}')
-                present.append(path)
-        if len(present) == 2:
+            try:
+                file_stat = path.stat()
+            except FileNotFoundError:
+                continue
+            if not stat_module.S_ISREG(file_stat.st_mode) or not self._hash_matches(path, digest, size, stat=file_stat):
+                raise DeliveryConflict(f'Arquivo no destino difere do histórico; preservado: {path.name}')
+            present.append(path)
+        handoff_policy = self.settings.get('delivery_retention_policy','require_present') == 'handoff'
+        if (handoff_policy and delivery['status'] == 'RESERVADO'
+                and delivery.get('publication_started_at') and len(present)<2):
+            raise DeliveryConflict(
+                'Publicação iniciada; possível consumo pelo importador; confirmação externa necessária. '
+                'Reserva e arquivos remanescentes preservados para evitar novo cadastro.')
+        handoff = handoff_policy and delivery['status'] == 'CONCLUIDO'
+        if len(present) == 2 or handoff:
             if delivery['job_id'] == job['id'] and (delivery['source_size'] != job['source_size']
                                                    or delivery['source_mtime_ns'] != job['source_mtime_ns']):
                 raise DeliveryConflict('Origem mudou, mas o nome anterior permanece no destino. Use um novo nome para a nova versão.')
             duplicate = delivery['job_id'] != job['id']
             status = 'DUPLICADO' if duplicate else 'CONCLUIDO'
+            cut_video = int(bool(delivery.get('cut_video',True)))
+            message = ('Entrega já realizada; arquivos removidos/consumidos após a transferência. Cadastro externo não confirmado.'
+                       if handoff and len(present)<2 else 'Material já processado e íntegro no destino.')
             if delivery['status'] != 'CONCLUIDO':
                 core.complete_automatic_delivery(job, self.dest)
                 core.monitor_event('RECUPERADO', f'Entrega íntegra reconciliada: {mxf}')
-            if job['status'] != status:
-                core.event(job['id'], status, 'Material já processado e íntegro no destino.',
+            if job['status'] != status or int(bool(job.get('cut_video',True))) != cut_video or (handoff and len(present)<2 and job['message'] != message):
+                core.event(job['id'], status, message,
                            output_path=str(mxf),xml_path=str(xml),output_sha256=delivery['output_sha256'],
                            xml_sha256=delivery['xml_sha256'],duplicate_of=delivery['job_id'] if duplicate else None,
                            delivered_mxf_bytes=delivery['delivered_mxf_bytes'],delivered_xml_bytes=delivery['delivered_xml_bytes'],
-                           delivery_verified_at=core.utcnow(),progress=1.,error_kind=None)
+                           delivery_verified_at=core.utcnow(),progress=1.,error_kind=None,cut_video=cut_video)
+                self._refresh_job(job['id'])
                 self.notify('refresh', None)
             return True
         # Recupera só artefatos que os hashes deste registro comprovam pertencer à EVA.
         for path in present:
             path.unlink()
             self.verified.pop(str(path), None)
+            if self._destination_names is not None:
+                self._destination_names.pop(path.name.casefold(), None)
         with core.db_connection() as db:
             db.execute('DELETE FROM automatic_deliveries WHERE media_key=? AND destination_key=?',
                        (core.media_key(job['source_path']),core.destination_key(self.dest)))
+        if self._deliveries is not None:
+            self._deliveries.pop(core.media_key(job['source_path']), None)
         retrying_failure = delivery['status'] != 'CONCLUIDO' and job['status'] == 'ERRO'
         core.event(job['id'], 'ERRO' if retrying_failure else 'NOVO',
                    job['message'] if retrying_failure else 'Entrega ausente/incompleta; recriação automática agendada.',
                    output_path=None,xml_path=None,progress=0.,error_kind=None,
                    next_retry_at=0 if delivery['status'] == 'CONCLUIDO' else job['next_retry_at'],
                    attempts=0 if delivery['status'] == 'CONCLUIDO' else job['attempts'])
+        self._refresh_job(job['id'])
         return False
 
     def _progress(self, job_id, progress, message):
@@ -265,20 +364,42 @@ class FolderWatcher:
         self.notify('progress', dict(job_id=job_id,progress=max(0.,min(1.,progress)),message=message))
 
     def _fail(self, job, exc, kind='TECNICO'):
-        previous = core.get_job(job['id'])
         message = str(exc)
+        if job['status'] == 'ERRO' and job['message'] == message and job['error_kind'] == kind:
+            return
+        previous = core.get_job(job['id'])
         if previous['status'] != 'ERRO' or previous['message'] != message or previous['error_kind'] != kind:
             core.event(job['id'], 'ERRO', message, error_kind=kind,progress=0.,
                        next_retry_at=time.time() + float(self.settings.get('retry_delay_sec',30)))
+        else:
+            return
         self._progress(job['id'], 0., message)
+        self.last_progress.pop(job['id'],None)
+        self._refresh_job(job['id'])
 
     def scan_once(self):
+        if self.stop_event.is_set():
+            return
+        try:
+            self._load_scan_snapshot()
+            self._scan_once_snapshot()
+        finally:
+            self._jobs_by_path = None
+            self._jobs_by_key = None
+            self._deliveries = None
+            self._destination_names = None
+
+    def _scan_once_snapshot(self):
         now = time.monotonic()
         stable = float(self.settings.get('stable_seconds', 10))
         paths = self._sources()
         current = set()
         ready = []
+        found_count = 0
         for path in paths:
+            if self.stop_event.is_set():
+                break
+            found_count += 1
             try:
                 stat = path.stat()
             except FileNotFoundError:
@@ -298,20 +419,41 @@ class FolderWatcher:
             if stat.st_size > 0 and now - self.observed[key][2] >= stable:
                 ready.append((path, stat))
         self.observed = {key:value for key,value in self.observed.items() if key in current}
+        active_media_keys = {core.media_key(path) for path in current}
+        retained_outputs = {delivery[field] for key in active_media_keys
+                            for delivery in [self._deliveries.get(key)] if delivery is not None
+                            for field in ('output_path','xml_path')}
+        self.verified = {path:signature for path,signature in self.verified.items() if path in retained_outputs}
+        queued = []
         for path, stat in ready:
             if self.stop_event.is_set():
                 break
             job = self._register(path, stat)
+            queued.append((job['id'],path,job))
+        # Registra o lote inteiro para acompanhamento, mas volta a observar a
+        # origem entre grupos pequenos. A ordem de cadastro mantém FIFO quando
+        # chega um nome alfabeticamente anterior aos vídeos que já aguardavam.
+        attempts_started = 0
+        budget = max(1,int(self.settings.get('max_jobs_per_scan',10)))
+        for _,path,queued_job in sorted(queued,key=lambda item:item[0]):
+            if self.stop_event.is_set() or attempts_started >= budget:
+                break
+            job = self._jobs_by_path.get(self._path_key(path),queued_job)
             did_work = False
             try:
                 if self._reconcile(job):
                     continue
-                job = core.get_job(job['id'])
+                job = self._jobs_by_path.get(self._path_key(job['source_path']),job)
                 if job['error_kind'] == 'CORTE' and job['analysis_signature'] != self.analysis_signature:
                     core.event(job['id'], 'NOVO', 'Detector ou configuração de análise alterado; nova análise automática.',
                                attempts=0,next_retry_at=0.,error_kind=None,progress=0.)
-                    job = core.get_job(job['id'])
-                if job['error_kind'] in ('CORTE', 'CONFLITO'):
+                    job = self._refresh_job(job['id'])
+                if job['error_kind'] == 'TECNICO' and bool(job.get('cut_video',True)) != bool(self.settings.get('cut_video',True)):
+                    core.event(job['id'], 'NOVO', 'Modo de corte alterado; nova tentativa de processamento.',
+                               attempts=0,next_retry_at=0.,error_kind=None,progress=0.,
+                               cut_video=int(bool(self.settings.get('cut_video',True))))
+                    job = self._refresh_job(job['id'])
+                if job['error_kind'] in ('CORTE', 'CONFLITO', 'IDENTIFICADOR'):
                     continue
                 if job['attempts'] >= int(self.settings.get('max_attempts',3)):
                     if job['status'] != 'ERRO':
@@ -321,9 +463,11 @@ class FolderWatcher:
                     continue
                 # Retoma estágios interrompidos por crash, sem herdar aprovações antigas.
                 did_work = True
+                attempts_started += 1
                 core.event(job['id'], 'ANALISANDO', 'Análise automática de black e pontos de corte.',
                            attempts=job['attempts']+1,progress=0.,error_kind=None,
-                           analysis_signature=self.analysis_signature)
+                           analysis_signature=self.analysis_signature,
+                           cut_video=int(bool(self.settings.get('cut_video',True))))
                 self._progress(job['id'], .02, 'Analisando black / claquete')
                 analyzed = core.analyze(job['id'], self.settings)
                 if analyzed['confidence'] != 'ALTA':
@@ -337,9 +481,15 @@ class FolderWatcher:
                 self._progress(job['id'], 1., 'Concluído')
             except DeliveryConflict as exc:
                 self._fail(job, exc, 'CONFLITO')
+            except core.MaterialIdentityConflict as exc:
+                self._fail(job, exc, 'IDENTIFICADOR')
             except Exception as exc:
                 self._fail(job, exc)
             finally:
                 if did_work:
+                    final_job = self._refresh_job(job['id'])
+                    self._delivery(final_job,refresh=True)
+                    self._remember_output_names(final_job)
+                    self.last_progress.pop(job['id'],None)
                     self.notify('refresh', None)
-        self.notify('message', f'Monitorando — {len(paths)} vídeo(s); {len(paths)-len(ready)} aguardando estabilidade da cópia.')
+        self.notify('message', f'Monitorando — {found_count} vídeo(s); {found_count-len(ready)} aguardando estabilidade da cópia.')

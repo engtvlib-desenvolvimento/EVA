@@ -87,17 +87,23 @@ def scan_video(path, duration, fps, settings):
     ratio = float(settings.get('black_picture_ratio', 1.))
     freeze_noise = float(settings.get('slate_freeze_noise_db', -50.))
     freeze_duration = float(settings.get('slate_min_sec', .5))
+    timeout = float(settings.get('analysis_timeout_sec', max(120., duration*5)))
     if not all(math.isfinite(value) for value in (threshold,ratio,freeze_noise,freeze_duration)):
         raise ValueError('Parâmetros de detecção não finitos')
     if not (0 <= threshold <= 1 and 0 < ratio <= 1 and freeze_duration > 0):
         raise ValueError('Limiares de black/claquete inválidos')
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError('analysis_timeout_sec deve ser positivo')
     filters = (f'setpts=PTS-STARTPTS,blackdetect=d=0:pix_th={threshold}:pic_th={ratio},'
                f'freezedetect=n={freeze_noise}dB:d={freeze_duration},metadata=mode=print')
     command = ['ffmpeg','-hide_banner','-nostdin','-nostats','-loglevel','info',
                '-i',str(path),'-map','0:v:0','-vf',filters,'-an','-f','null','-']
-    result = subprocess.run(command,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,
-                            text=True,encoding='utf-8',errors='replace',
-                            creationflags=SUBPROCESS_FLAGS)
+    try:
+        result = subprocess.run(command,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,
+                                text=True,encoding='utf-8',errors='replace',
+                                creationflags=SUBPROCESS_FLAGS,timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f'Análise de claquete/black excedeu {timeout:g}s; a fila continuará com os demais materiais.') from exc
     if result.returncode:
         raise RuntimeError('Falha ao analisar black/claquete: ' + result.stderr[-2000:])
     return parse_scan_output(result.stderr,duration,fps,settings)

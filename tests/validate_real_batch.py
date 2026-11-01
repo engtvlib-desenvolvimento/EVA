@@ -46,11 +46,12 @@ def validate_file(source, destination, settings):
     rate = Fraction(analyzed['fps'])
     mark_in_frame = round(analyzed['mark_in'] * float(rate))
     mark_out_frame = round(analyzed['mark_out'] * float(rate))
-    expected_frames = mark_out_frame - mark_in_frame
+    source_frames = round(Fraction(source_video['duration_ts']) * Fraction(source_video['time_base']) * rate)
+    cut_video = core.cut_enabled(settings)
+    expected_frames = mark_out_frame - mark_in_frame if cut_video else source_frames
     expected_samples = round(float(Fraction(expected_frames, 1) / rate) * 48000)
     if mark_in_frame < 0 or mark_out_frame <= mark_in_frame:
         raise AssertionError('Cortes inválidos')
-    source_frames = round(Fraction(source_video['duration_ts']) * Fraction(source_video['time_base']) * rate)
     if mark_out_frame > source_frames:
         raise AssertionError('Mark Out ultrapassa o último frame da origem')
     print('ANALISADO ' + json.dumps({'file': source.name, 'mark_in': analyzed['mark_in'],
@@ -80,11 +81,16 @@ def validate_file(source, destination, settings):
         raise AssertionError('Hash da saída diverge do histórico')
     if core.sha256(Path(result['xml_path'])) != result['xml_sha256']:
         raise AssertionError('Hash do XML diverge do histórico')
-    core.ET.parse(result['xml_path'])
+    metadata = core.ET.parse(result['xml_path'])
+    if settings.get('xml_profile','eva') == 'eva':
+        if cut_video and any('mark' in element.tag.casefold() for element in metadata.iter()):
+            raise AssertionError('XML de vídeo cortado contém marcas')
+        if not cut_video and (metadata.findtext('MarkIn'),metadata.findtext('MarkOut')) != (str(mark_in_frame),str(mark_out_frame)):
+            raise AssertionError('XML integral não contém as marcas da origem')
     after = source.stat()
     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or core.sha256(source) != source_hash:
         raise AssertionError('Arquivo original alterado')
-    return dict(file=source.name, status='CONCLUIDO', mark_in=analyzed['mark_in'],
+    return dict(file=source.name, status='CONCLUIDO', cut_video=cut_video, mark_in=analyzed['mark_in'],
                 mark_out=analyzed['mark_out'], duration=core.duration_from_probe(probe),
                 decoded_frames=decoded_frames, audio_streams=len(audio),
                 expected_audio_samples=expected_samples, original_preserved=True,
@@ -96,12 +102,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', required=True, type=Path)
     parser.add_argument('--report', type=Path, help='Salva somente o relatório JSON; arquivos de mídia continuam temporários.')
+    parser.add_argument('--cut-video',action=argparse.BooleanOptionalAction,default=None,
+                        help='Força corte físico; --no-cut-video valida a saída integral com marcas no XML.')
     args = parser.parse_args()
     source = args.source.expanduser().resolve()
     if not source.is_dir():
         parser.error('Pasta de origem inexistente')
     files = sorted(path for path in source.rglob('*') if path.is_file() and path.suffix.lower() in core.VIDEO_EXTENSIONS)
     settings = core.config()
+    if args.cut_video is not None:
+        settings['cut_video']=args.cut_video
     records = []
     production_db = core.DB_FILE
     started = time.monotonic()

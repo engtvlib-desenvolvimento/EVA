@@ -1,20 +1,22 @@
 # EVA — Estação de Vídeo Automatizada
 
-**v0.3 · Fila automática de preparação de vídeos para TV**
+**v0.4 · Preparação de vídeos, metadados e fila automática para TV**
 
-A EVA acompanha uma pasta de origem, identifica os materiais novos, remove claquete e blacks quando consegue determinar os cortes, remapeia o áudio e entrega MXF + XML na pasta de destino. A interface mostra o andamento e permite exportar os logs. Não é necessário selecionar, aprovar ou gerar cada vídeo manualmente.
+A EVA acompanha uma pasta de origem, identifica os materiais novos, analisa claquete/blacks, remapeia o áudio e entrega MXF + XML na pasta de destino. A interface mostra o andamento e permite exportar os logs. Não é necessário selecionar, aprovar ou gerar cada vídeo manualmente.
 
 ## Operação
 
 1. Instale Python 3.10+ com Tkinter e coloque `ffmpeg` e `ffprobe` no `PATH`.
 2. Execute `iniciar.bat` ou `python app.py`.
 3. Escolha **Origem** e **Destino** na interface. As duas pastas devem existir e ficar separadas; o destino pode ser um compartilhamento de rede UNC.
-4. Clique em **Iniciar monitoramento**. Os vídeos que já estão na origem também entram na verificação.
+4. Escolha **corte de vídeo** e clique em **Iniciar monitoramento**. Os vídeos que já estão na origem também entram na verificação.
 5. Acompanhe os estados, o progresso e as mensagens por material. **Exportar logs** gera um ZIP com os relatórios CSV, inclusive tentativas que falharam.
 
 **Parar após atual** encerra o monitoramento depois do material em processamento. Fechar a janela também aguarda essa conclusão. A interface precisa permanecer aberta para monitorar: esta versão é um aplicativo desktop, não um serviço Windows.
 
 As pastas escolhidas ficam salvas no `config.json`. `watch_on_start: true` permite iniciar o monitoramento ao abrir o aplicativo.
+
+Com **corte de vídeo marcado**, a EVA remove fisicamente a claquete/blacks e omite todas as marcas no XML. Com a opção **desmarcada**, preserva o vídeo integral e informa Mark In/Out no XML em coordenadas do arquivo original. Os dois modos produzem 16 pistas mono PCM 24-bit/48 kHz. Vídeo integral já compatível com o perfil MPEG-2 é copiado sem recodificar a imagem. O modo escolhido fica registrado no histórico; mudar a caixa não substitui entregas já concluídas.
 
 ## Fluxo automático e histórico
 
@@ -28,8 +30,9 @@ O SQLite registra a origem, as etapas, os cortes, as tentativas, o destino e a i
 - **Nome já existente sem uma entrega comprovada:** registra conflito e preserva o arquivo existente. O programa não sobrescreve materiais de terceiros.
 - **Falha de leitura, codificação ou rede:** registra o erro e segue com os outros materiais. Novas tentativas têm intervalo e limite persistidos no banco; reabrir o aplicativo não zera esse limite.
 - **Cortes ambíguos:** registra falha de análise e segue a fila, sem publicar um corte estimado de baixa confiança. Uma mudança nos parâmetros ou na revisão do detector permite uma nova análise automática; reiniciar com a mesma configuração não repete indefinidamente a falha.
+- **Pasta consumida pelo importador:** com `delivery_retention_policy: "handoff"`, arquivos removidos após uma entrega concluída não provocam reenvio. Se a publicação foi interrompida e existe dúvida sobre consumo pelo Smartware, a EVA preserva a reserva e registra a necessidade de confirmação externa.
 
-Os originais são preservados. O processamento usa uma pasta de trabalho; a transferência escreve arquivos `.part`, verifica SHA-256 e publica os nomes finais sem substituição. O histórico e os hashes permitem reconciliar uma entrega interrompida. Um lock do monitor impede duas instâncias de processarem o mesmo banco simultaneamente; locks remotos ou sem identificação suficiente exigem conferência.
+Os originais são preservados. O processamento usa uma pasta de trabalho; a transferência escreve arquivos `.part`, verifica SHA-256 e publica os nomes finais sem substituição. Em `handoff`, a releitura de integridade ocorre antes de publicar, pois o importador pode consumir os nomes finais imediatamente. O histórico e os hashes permitem reconciliar uma entrega interrompida. Um lock do monitor impede duas instâncias de processarem o mesmo banco simultaneamente; locks remotos ou sem identificação suficiente exigem conferência.
 
 O banco existente é atualizado sem apagar seus dados. Preserve `historico.sqlite3` ao atualizar a aplicação. Faça backup com a EVA fechada.
 
@@ -83,12 +86,23 @@ Além das pastas salvas pela interface, estes parâmetros podem ser ajustados no
 | `retry_delay_sec` | 30 | Intervalo entre tentativas após falha |
 | `watch_on_start` | `false` | Inicia o monitor ao abrir a interface |
 | `working_folder` | Pasta de trabalho configurada | Arquivos temporários de codificação |
+| `cut_video` | `true` | Corte físico; `false` mantém o vídeo e envia as marcas no XML |
+| `ui_history_limit` | 500 | Linhas recentes exibidas; contadores e exportação incluem todo o histórico |
+| `max_jobs_per_scan` | 10 | Máximo de tentativas antes de voltar a observar arquivos novos/alterados |
+| `ffmpeg_stall_timeout_sec` | 180 | Interrompe codificação sem avanço e libera a fila |
+| `analysis_timeout_sec` | 300 | Tempo máximo de análise por material; ajustar para vídeos longos |
+| `delivery_retention_policy` | `require_present` | Usar `handoff` quando o importador move/consome a entrega |
+| `publication_order` | `xml_first` | Ou `mxf_first`, conforme o gatilho documentado do importador |
+
+A varredura usa snapshot do banco e índice do destino, sem abrir uma conexão por vídeo conhecido. A interface agrupa atualizações e limita o histórico exibido. Logs são exportados em blocos diretamente para ZIP. A fila permanece sequencial para limitar CPU, memória e tráfego; o espaço livre é conferido antes de codificar. Essas medidas não equivalem a um ensaio de capacidade na rede de produção.
 
 ## Destino futuro: Floripa
 
-Hoje o XML produzido por `core.xml_for_job()` é demonstrativo (`EXEMPLO-NAO-FLORIPA`). Para integrar com a Floripa, será necessário adaptar esse XML ao schema aceito, confirmar o mapa das 16 pistas e verificar a ordem de publicação do par XML/MXF e o gatilho de ingestão.
+O [Smartware documenta ingest com metadados XML](https://www.floripatec.com.br/produto/smartware/), mas o contrato de campos depende da instalação. A EVA extrai `CM=P0320866` e `IDK7=320866` do nome `P0320866_...mxf`, preservando o CM e retirando letras/zeros à esquerda do IDK7. Identidades repetidas por outro nome de arquivo são bloqueadas no destino para evitar duplicidade de cadastro.
 
-Uma pasta de destino comum pode ser usada para preparar e conferir os materiais. Quando o destino escolhido coincide com `floripa_folder`, o envio exige as três configurações existentes: `enable_publish_to_floripa`, `xml_homologated` e `audio_layout_homologated`. Essas flags declaram que a integração foi validada; não transformam o XML demonstrativo em um XML compatível.
+O perfil padrão `xml_profile: "eva"` produz um rascunho explícito (`EVA-INGEST-DRAFT-1`), que não deve ser confundido com XML aceito pelo Smartware. O perfil `smartware_template` preenche templates reais separados para vídeo cortado e integral, configurados em `smartware_xml_template_cut` e `smartware_xml_template_uncut`. É necessário obter um modelo aceito, as unidades das marcas e a configuração de importação. Os exemplos e o procedimento estão em [INTEGRACAO_SMARTWARE.md](INTEGRACAO_SMARTWARE.md).
+
+Uma pasta de destino comum pode ser usada para preparar e conferir os materiais. Quando o destino escolhido coincide com `floripa_folder`, o envio exige as três configurações existentes: `enable_publish_to_floripa`, `xml_homologated` e `audio_layout_homologated`, além do perfil com template real. Essas flags declaram que a integração foi validada. `CONCLUIDO` significa entrega verificada; cadastro efetivo no Smartware exige confirmação do importador, que não é fornecida pelo simples envio ao watch-folder.
 
 ## Logs, testes e executável
 

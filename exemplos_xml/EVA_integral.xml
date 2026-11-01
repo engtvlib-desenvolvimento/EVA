@@ -1,0 +1,15 @@
+<?xml version='1.0' encoding='utf-8'?>
+<Material schema="EVA-INGEST-DRAFT-1">
+  <CM>P0320866</CM>
+  <IDK7>320866</IDK7>
+  <Arquivo>P0320866_ENCONTRO.mxf</Arquivo>
+  <DuracaoSegundos>47.747700000</DuracaoSegundos>
+  <FPS>30000/1001</FPS>
+  <SHA256>EXEMPLO-NAO-E-HASH-REAL</SHA256>
+  <CorteAplicado>false</CorteAplicado>
+  <CriadoUTC>2026-11-01T20:41:43+00:00</CriadoUTC>
+  <MarkIn unit="frames" base="0">150</MarkIn>
+  <MarkOut unit="frames" base="0" end="exclusive">1345</MarkOut>
+  <MarkInSegundos>5.005000000</MarkInSegundos>
+  <MarkOutSegundos end="exclusive">44.878166667</MarkOutSegundos>
+</Material>
