@@ -1,4 +1,3 @@
-"""Entrega para importador que consome imediatamente, identidades e logs em lote."""
 import csv
 import io
 import os
