@@ -95,6 +95,17 @@ class TestApp(unittest.TestCase):
         self.assertEqual(self.window.xml_status_text.get(),
                          'XML de conferência: cadastro no Smartware ainda não configurado.')
 
+    def test_xml_status_identifies_builtin_floripa_profile(self):
+        checked=dict(self.settings,xml_profile='smartware')
+        self.window.notify('settings',checked)
+        self.window.consume_events()
+        self.assertEqual(self.window.xml_status_text.get(),
+                         'XML Smartware: padrão da Floripa · operador EVA.')
+        self.assertNotIn('confirmado',self.window.xml_status_text.get().lower())
+        self.window.notify('settings',dict(checked,xml_profile='smartware_template'))
+        self.window.consume_events()
+        self.assertEqual(self.window.xml_status_text.get(),'XML configurado por template do importador.')
+
     def test_unchecked_mode_is_saved_and_passed_as_worker_snapshot(self):
         captured=[]
         outer=self

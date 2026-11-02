@@ -1,7 +1,7 @@
-"""Identificadores e XML da EVA, com adaptação por template do importador real.
+"""Identificadores e XML de cadastro, conforme o modelo Floripa fornecido.
 
-O perfil ``eva`` é um rascunho explícito, não um contrato SmartWare. O perfil
-``smartware_template`` só preenche um XML fornecido para a instalação do usuário.
+``smartware`` gera o layout video em ISO-8859-1; ``smartware_template`` permite
+adaptar o mapeamento da instalação. ``eva`` mantém o rascunho de conferência.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from xml.etree import ElementTree as ET
 
 CM_RE = re.compile(r'^([A-Za-z]+)([0-9]+)(?=$|[\s_.-])')
 TOKEN_RE = re.compile(r'\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}')
-BASE_TOKENS = {'CM', 'IDK7', 'FILENAME', 'DURATION_SECONDS', 'SHA256', 'FPS'}
+BASE_TOKENS = {'CM', 'IDK7', 'FILENAME', 'TITLE', 'DURATION_SECONDS', 'SHA256', 'FPS'}
 IN_TOKENS = {'MARK_IN_FRAMES', 'MARK_IN_SECONDS'}
 OUT_TOKENS = {'MARK_OUT_FRAMES', 'MARK_OUT_LAST_FRAME', 'MARK_OUT_SECONDS'}
 MARK_TOKENS = IN_TOKENS | OUT_TOKENS
@@ -47,9 +47,23 @@ def _cut_enabled(settings):
 
 def _profile(settings):
     value = settings.get('xml_profile', 'eva')
-    if value not in ('eva', 'smartware_template'):
-        raise ValueError('xml_profile deve ser eva ou smartware_template.')
+    if value not in ('eva', 'smartware', 'smartware_template'):
+        raise ValueError('xml_profile deve ser eva, smartware ou smartware_template.')
     return value
+
+
+def _smartware_options(settings):
+    group = settings.get('smartware_group', 'Opec')
+    if not isinstance(group, str) or not group.strip():
+        raise ValueError('smartware_group deve conter o grupo de cadastro, por exemplo Opec.')
+    if any(not (ord(c) in (9, 10, 13) or 0x20 <= ord(c) <= 0xD7FF
+                or 0xE000 <= ord(c) <= 0xFFFD or 0x10000 <= ord(c) <= 0x10FFFF)
+           for c in group):
+        raise ValueError('smartware_group contém caracteres inválidos para XML.')
+    mark_out = settings.get('smartware_mark_out', 'exclusive')
+    if mark_out not in ('inclusive', 'exclusive'):
+        raise ValueError('smartware_mark_out deve ser inclusive ou exclusive.')
+    return group.strip(), mark_out
 
 
 def _local_name(name):
@@ -126,16 +140,22 @@ def _load_template(settings):
 def validate_xml_settings(settings):
     """Valida o perfil e o template selecionado antes de iniciar a codificação."""
     _cut_enabled(settings)
-    if _profile(settings) == 'smartware_template':
+    profile = _profile(settings)
+    if profile == 'smartware':
+        _smartware_options(settings)
+    elif profile == 'smartware_template':
         _load_template(settings)
 
 
 def metadata_context(job, output_duration, digest, settings):
     """Valores de cadastro; marcas usam frames base zero e fim exclusivo."""
     cut = _cut_enabled(settings)
-    required = _profile(settings) == 'smartware_template'
+    required = _profile(settings) != 'eva'
     source = Path(job['source_path'])
     cm, idk7 = material_identifiers(source, required=required)
+    identifier = CM_RE.match(source.stem)
+    title = re.sub(r'^[\s_.-]+', '', source.stem[identifier.end():]) if identifier else source.stem
+    title = title or cm or source.stem
     duration = float(output_duration)
     if not math.isfinite(duration) or duration <= 0:
         raise ValueError('Duração de saída inválida para o XML.')
@@ -147,6 +167,7 @@ def metadata_context(job, output_duration, digest, settings):
         raise ValueError('FPS inválido para o XML.')
     values = {
         'CM': cm, 'IDK7': idk7, 'FILENAME': source.stem + '.mxf',
+        'TITLE': title,
         'DURATION_SECONDS': f'{duration:.9f}', 'SHA256': str(digest),
         'FPS': f'{rate.numerator}/{rate.denominator}'
     }
@@ -162,6 +183,8 @@ def metadata_context(job, output_duration, digest, settings):
         end = round(mark_out * rate)
         if first < 0 or end <= first:
             raise ValueError('Mark In/Mark Out não delimitam frames válidos.')
+        if end > round(duration * rate):
+            raise ValueError('Mark Out ultrapassa o fim do vídeo integral em frames.')
         values.update(MARK_IN_FRAMES=str(first), MARK_OUT_FRAMES=str(end),
                       MARK_OUT_LAST_FRAME=str(end-1),
                       MARK_IN_SECONDS=f'{float(Fraction(first, 1)/rate):.9f}',
@@ -188,13 +211,39 @@ def _draft_xml(context, cut):
     return root
 
 
+def _smartware_xml(context, cut, settings):
+    """O campo codigo usa o IDK7; cm/idk7 explicitam o cadastro solicitado.
+
+    O markOut é o primeiro frame após o conteúdo, conforme confirmado para esta
+    instalação. A opção inclusive atende importadores que usam o último frame.
+    """
+    group, out_convention = _smartware_options(settings)
+    root = ET.Element('video')
+    fields = {
+        'codigo': context['IDK7'], 'arquivo': context['FILENAME'],
+        'titulo': context['TITLE'], 'grupo': group, 'operador': 'EVA',
+        'cm': context['CM'], 'idk7': context['IDK7']
+    }
+    if not cut:
+        fields['markIn'] = context['MARK_IN_FRAMES']
+        fields['markOut'] = context['MARK_OUT_LAST_FRAME' if out_convention == 'inclusive'
+                                    else 'MARK_OUT_FRAMES']
+    fields['remover'] = '0'
+    for name, value in fields.items():
+        ET.SubElement(root, name).text = value
+    return root
+
+
 def write_xml(job, output_duration, digest, xml_path, settings):
-    """Gera rascunho EVA ou preenche somente texto/atributos do template real."""
+    """Gera o XML Floripa, um rascunho EVA ou preenche o template configurado."""
     validate_xml_settings(settings)
     cut = _cut_enabled(settings)
     context = metadata_context(job, output_duration, digest, settings)
-    if _profile(settings) == 'eva':
+    profile = _profile(settings)
+    if profile == 'eva':
         root = _draft_xml(context, cut)
+    elif profile == 'smartware':
+        root = _smartware_xml(context, cut, settings)
     else:
         root = _load_template(settings)
         def replace(value):
@@ -209,5 +258,6 @@ def write_xml(job, output_duration, digest, xml_path, settings):
     tree = ET.ElementTree(root)
     ET.indent(tree, space='  ')
     target = Path(xml_path)
-    tree.write(target, encoding='utf-8', xml_declaration=True)
+    tree.write(target, encoding='ISO-8859-1' if profile == 'smartware' else 'utf-8',
+               xml_declaration=True)
     return target

@@ -64,8 +64,9 @@ class TestProcessingModes(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stderr)
         return [packet['data_hash'] for packet in json.loads(result.stdout)['packets']]
 
-    def exercise(self,cut):
+    def exercise(self,cut,xml_profile='eva'):
         self.settings['cut_video']=cut
+        self.settings['xml_profile']=xml_profile
         source_hash=core.sha256(self.source)
         job=core.analyze(self.job_id,self.settings)
         self.assertEqual(job['confidence'],'ALTA',job)
@@ -80,12 +81,21 @@ class TestProcessingModes(unittest.TestCase):
         self.assertTrue(all(stream['codec_name']=='pcm_s24le' and stream['channels']==1
                             and stream['sample_rate']=='48000' for stream in audio))
         xml=core.ET.parse(result['xml_path'])
-        self.assertEqual((xml.findtext('CM'),xml.findtext('IDK7')),('P0320866','320866'))
+        native = xml_profile == 'smartware'
+        self.assertEqual((xml.findtext('cm' if native else 'CM'),xml.findtext('idk7' if native else 'IDK7')),
+                         ('P0320866','320866'))
+        if native:
+            self.assertEqual(xml.getroot().tag,'video')
+            self.assertEqual(xml.findtext('codigo'),'320866')
+            self.assertEqual(xml.findtext('operador'),'EVA')
+            self.assertEqual(xml.findtext('arquivo'),Path(result['output_path']).name)
         if cut:
             self.assertFalse(any('mark' in element.tag.casefold() for element in xml.iter()))
         else:
-            self.assertEqual((xml.findtext('MarkIn'),xml.findtext('MarkOut')),('125','308'))
-            self.assertEqual(xml.find('MarkOut').get('end'),'exclusive')
+            self.assertEqual((xml.findtext('markIn' if native else 'MarkIn'),
+                              xml.findtext('markOut' if native else 'MarkOut')),('125','308'))
+            if not native:
+                self.assertEqual(xml.find('MarkOut').get('end'),'exclusive')
             self.assertEqual(self.packets(self.source),self.packets(result['output_path']),
                              'O vídeo integral compatível deve conservar os pacotes de imagem sem recodificação')
         self.assertEqual(result['cut_video'],int(cut))
@@ -99,6 +109,22 @@ class TestProcessingModes(unittest.TestCase):
 
     def test_full_video_remaps_audio_and_writes_original_marks(self):
         self.exercise(False)
+
+    def test_smartware_physical_cut_has_identifiers_operator_and_no_marks(self):
+        self.exercise(True,xml_profile='smartware')
+
+    def test_smartware_full_video_has_source_marks_with_exclusive_out(self):
+        self.exercise(False,xml_profile='smartware')
+
+    def test_smartware_invalid_identifier_fails_before_transcoding(self):
+        core.event(self.job_id,'APROVADO','Teste de cadastro',fps='25/1',mark_in=5,mark_out=12.32,
+                   source_path=str(self.root/'SEM_CODIGO.mxf'))
+        self.settings['xml_profile']='smartware'
+        with patch.object(core,'run_probe') as probe, patch.object(core,'run_transcode') as transcode:
+            with self.assertRaisesRegex(ValueError,'CM/IDK7'):
+                core.process(self.job_id,settings=self.settings,automatic=True)
+            probe.assert_not_called()
+            transcode.assert_not_called()
 
 
 if __name__=='__main__':

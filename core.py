@@ -153,7 +153,7 @@ def validate_watch_settings(settings):
     result['analysis_timeout_sec']=analysis_timeout
     validate_xml_settings(result)
     if result.get('floripa_folder') and destination == Path(result['floripa_folder']).expanduser().resolve():
-        if result.get('xml_profile', 'eva') != 'smartware_template':
+        if result.get('xml_profile', 'eva') not in ('smartware', 'smartware_template'):
             raise ValueError('A pasta Floripa exige XML de integração real configurado; o XML EVA não é um contrato Smartware.')
     missing = [name for name in ('ffmpeg', 'ffprobe') if not shutil.which(name)]
     if missing:
@@ -951,7 +951,7 @@ def process(job_id, callback=lambda x,y:None, publish=False, settings=None, auto
     settings = dict(settings or config())
     cut_video = cut_enabled(settings)
     validate_xml_settings(settings)
-    cm,idk7 = material_identifiers(job['source_path'], required=settings.get('xml_profile','eva')=='smartware_template')
+    cm,idk7 = material_identifiers(job['source_path'], required=settings.get('xml_profile','eva') in ('smartware','smartware_template'))
     job.update(cut_video=int(cut_video),cm=cm,idk7=idk7)
     if automatic:
         settings['local_output_folder'] = settings['destination_folder']
@@ -1079,7 +1079,7 @@ def process(job_id, callback=lambda x,y:None, publish=False, settings=None, auto
             if automatic:
                 complete_automatic_delivery(job, local_dest)
             event(job_id,'CONCLUIDO' if automatic else 'PREPARADO',
-                  ('MXF e XML entregues e verificados; cadastro Smartware não confirmado' if settings.get('xml_profile','eva')=='smartware_template'
+                  ('MXF e XML entregues e verificados; cadastro Smartware não confirmado' if settings.get('xml_profile','eva') in ('smartware','smartware_template')
                    else 'MXF e XML EVA entregues e verificados no destino') if automatic else
                   'MXF e XML preparados na pasta local',
                   output_path=target_mxf,xml_path=target_xml,output_sha256=digest,

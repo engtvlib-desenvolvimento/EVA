@@ -82,11 +82,21 @@ def validate_file(source, destination, settings):
     if core.sha256(Path(result['xml_path'])) != result['xml_sha256']:
         raise AssertionError('Hash do XML diverge do histórico')
     metadata = core.ET.parse(result['xml_path'])
+    if cut_video and any('markin' in element.tag.casefold() or 'markout' in element.tag.casefold()
+                         for element in metadata.iter()):
+        raise AssertionError('XML de vídeo cortado contém marcas')
     if settings.get('xml_profile','eva') == 'eva':
-        if cut_video and any('mark' in element.tag.casefold() for element in metadata.iter()):
-            raise AssertionError('XML de vídeo cortado contém marcas')
         if not cut_video and (metadata.findtext('MarkIn'),metadata.findtext('MarkOut')) != (str(mark_in_frame),str(mark_out_frame)):
             raise AssertionError('XML integral não contém as marcas da origem')
+    elif settings.get('xml_profile') == 'smartware':
+        cm,idk7=core.material_identifiers(source,required=True)
+        if metadata.getroot().tag != 'video' or (metadata.findtext('codigo'),metadata.findtext('cm'),metadata.findtext('idk7')) != (idk7,cm,idk7):
+            raise AssertionError('XML Smartware não contém os campos de cadastro esperados')
+        if metadata.findtext('operador') != 'EVA' or metadata.findtext('arquivo') != output.name:
+            raise AssertionError('Operador ou arquivo divergente no XML Smartware')
+        expected_out=mark_out_frame-(settings.get('smartware_mark_out','exclusive')=='inclusive')
+        if not cut_video and (metadata.findtext('markIn'),metadata.findtext('markOut')) != (str(mark_in_frame),str(expected_out)):
+            raise AssertionError('XML Smartware integral não contém as marcas da origem')
     after = source.stat()
     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or core.sha256(source) != source_hash:
         raise AssertionError('Arquivo original alterado')

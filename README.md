@@ -96,13 +96,17 @@ Além das pastas salvas pela interface, estes parâmetros podem ser ajustados no
 
 A varredura usa snapshot do banco e índice do destino, sem abrir uma conexão por vídeo conhecido. A interface agrupa atualizações e limita o histórico exibido. Logs são exportados em blocos diretamente para ZIP. A fila permanece sequencial para limitar CPU, memória e tráfego; o espaço livre é conferido antes de codificar. Essas medidas não equivalem a um ensaio de capacidade na rede de produção.
 
-## Destino futuro: Floripa
+## Cadastro no SmartWare / Floripa
 
 O [Smartware documenta ingest com metadados XML](https://www.floripatec.com.br/produto/smartware/), mas o contrato de campos depende da instalação. A EVA extrai `CM=P0320866` e `IDK7=320866` do nome `P0320866_...mxf`, preservando o CM e retirando letras/zeros à esquerda do IDK7. Identidades repetidas por outro nome de arquivo são bloqueadas no destino para evitar duplicidade de cadastro.
 
-O perfil padrão `xml_profile: "eva"` produz um rascunho explícito (`EVA-INGEST-DRAFT-1`), que não deve ser confundido com XML aceito pelo Smartware. O perfil `smartware_template` preenche templates reais separados para vídeo cortado e integral, configurados em `smartware_xml_template_cut` e `smartware_xml_template_uncut`. É necessário obter um modelo aceito, as unidades das marcas e a configuração de importação. Os exemplos e o procedimento estão em [INTEGRACAO_SMARTWARE.md](INTEGRACAO_SMARTWARE.md).
+O perfil `xml_profile: "smartware"` segue a estrutura do XML fornecido pelo usuário: raiz `video`, encoding `ISO-8859-1`, `codigo` preenchido com o IDK7, nome do arquivo, título, grupo `Opec`, operador `EVA` e `remover=0`. O grupo pode ser ajustado em `smartware_group`. As tags adicionais `cm` e `idk7` carregam os dois identificadores, conforme autorizado pelo usuário; o preenchimento efetivo das colunas deve ser conferido no SmartWare.
 
-Uma pasta de destino comum pode ser usada para preparar e conferir os materiais. Quando o destino escolhido coincide com `floripa_folder`, o envio exige as três configurações existentes: `enable_publish_to_floripa`, `xml_homologated` e `audio_layout_homologated`, além do perfil com template real. Essas flags declaram que a integração foi validada. `CONCLUIDO` significa entrega verificada; cadastro efetivo no Smartware exige confirmação do importador, que não é fornecida pelo simples envio ao watch-folder.
+Com **corte de vídeo marcado**, o XML SmartWare omite `markIn` e `markOut`. Com a opção **desmarcada**, envia as marcas do vídeo integral. O padrão `smartware_mark_out: "exclusive"` segue a confirmação do usuário: Mark Out é o primeiro frame após o conteúdo. A alternativa `inclusive` está disponível para outras instalações que usem o último frame de conteúdo.
+
+Os perfis `eva` (rascunho explícito `EVA-INGEST-DRAFT-1`) e `smartware_template` continuam disponíveis. O segundo usa templates específicos separados em `smartware_xml_template_cut` e `smartware_xml_template_uncut`. Os exemplos XML e o procedimento de mapeamento estão em [INTEGRACAO_SMARTWARE.md](INTEGRACAO_SMARTWARE.md).
+
+Uma pasta de destino comum pode ser usada para preparar e conferir os materiais. Quando o destino escolhido coincide com `floripa_folder`, o envio exige as três configurações existentes: `enable_publish_to_floripa`, `xml_homologated` e `audio_layout_homologated`, além de um perfil SmartWare configurado. Essas flags declaram que a integração foi validada. `CONCLUIDO` significa entrega verificada; cadastro efetivo no SmartWare exige confirmação do importador, que não é fornecida pelo simples envio ao watch-folder.
 
 ## Logs, testes e executável
 

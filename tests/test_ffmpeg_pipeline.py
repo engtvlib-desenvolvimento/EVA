@@ -31,7 +31,8 @@ class TestRealPipeline(unittest.TestCase):
         self.settings = core.config()
         self.settings.update(source_folder=str(self.source),destination_folder=str(self.dest),
                              working_folder=str(self.root/'work'),video_profile='teste',
-                             stable_seconds=.1,watch_interval_sec=.05,max_attempts=1)
+                             stable_seconds=.1,watch_interval_sec=.05,max_attempts=1,
+                             xml_profile='smartware')
 
     def create_video(self, path, final_black, broadcast=False):
         # Claquete 5s + black separador 5s + comercial 5s + black final opcional.
@@ -78,7 +79,7 @@ class TestRealPipeline(unittest.TestCase):
         worker = threading.Thread(target=run)
         worker.start()
         try:
-            shutil.copyfile(original,self.source / ('comercial' + extension))
+            shutil.copyfile(original,self.source / ('P0320866_comercial' + extension))
             self.assertTrue(done.wait(45),core.jobs())
         finally:
             stop.set()
@@ -108,7 +109,12 @@ class TestRealPipeline(unittest.TestCase):
         self.assertEqual(core.sha256(original),digest)
         self.assertEqual(core.sha256(Path(job['output_path'])),job['output_sha256'])
         xml = core.ET.parse(job['xml_path'])
-        self.assertEqual(xml.findtext('Arquivo'),'comercial.mxf')
+        self.assertEqual(xml.getroot().tag,'video')
+        self.assertEqual(xml.findtext('arquivo'),'P0320866_comercial.mxf')
+        self.assertEqual((xml.findtext('codigo'),xml.findtext('cm'),xml.findtext('idk7')),
+                         ('320866','P0320866','320866'))
+        self.assertEqual(xml.findtext('operador'),'EVA')
+        self.assertFalse(any('mark' in element.tag.casefold() for element in xml.iter()))
         # Uma nova varredura não pode gerar outro evento de entrega.
         retry = FolderWatcher(self.settings)
         retry.settings['stable_seconds']=0

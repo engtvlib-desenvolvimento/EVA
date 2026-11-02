@@ -805,6 +805,13 @@ class TestWatchConfiguration(unittest.TestCase):
         checked = core.validate_watch_settings(self.settings)
         self.assertEqual(Path(checked['destination_folder']), Path(self.settings['destination_folder']).resolve())
 
+    def test_floripa_destination_accepts_native_smartware_xml(self):
+        self.settings.update(floripa_folder=self.settings['destination_folder'],
+                             enable_publish_to_floripa=True,xml_homologated=True,
+                             audio_layout_homologated=True,xml_profile='smartware')
+        checked=core.validate_watch_settings(self.settings)
+        self.assertEqual(checked['xml_profile'],'smartware')
+
     def test_save_preferences_preserves_audio_map_and_source_destination(self):
         config_path = self.root / 'config.json'
         with patch.object(core, 'CONFIG_FILE', config_path):

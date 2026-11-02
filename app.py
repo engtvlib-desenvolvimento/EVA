@@ -140,7 +140,10 @@ class App(tk.Tk):
 
     @staticmethod
     def xml_profile_message(settings):
-        if settings.get('xml_profile', 'eva') == 'smartware_template':
+        profile = settings.get('xml_profile', 'eva')
+        if profile == 'smartware':
+            return ''
+        if profile == 'smartware_template':
             return 'XML configurado por template do importador.'
         return 'XML de conferência: cadastro no Smartware ainda não configurado.'
 

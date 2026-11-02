@@ -21,6 +21,7 @@ settings['working_folder']=str(root/'work')
 settings['local_output_folder']=str(root/'local')
 settings['floripa_folder']=str(root/'destino')
 settings['video_profile']='teste'
+settings['xml_profile']='eva'  # DEMO não tem CM; este ensaio usa XML de conferência.
 settings['normalize_audio']=True
 settings['enable_publish_to_floripa']=True  # somente área de teste!
 settings['xml_homologated']=True  # testes sintéticos apenas
