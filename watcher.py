@@ -1,4 +1,3 @@
-"""Watch-folder sequencial: descobre, reconcilia e processa sem ações por vídeo."""
 from __future__ import annotations
 
 import ctypes
@@ -46,8 +45,7 @@ def process_is_alive(pid):
     return True
 
 
-def remove_abandoned_lock(path):
-    """Só remove lock de processo comprovadamente encerrado nesta máquina."""
+def remove_abandoned_lock(path):    
     if not path.exists():
         return
     try:
@@ -86,8 +84,7 @@ class FolderWatcher:
     def _path_key(path):
         return os.path.normcase(str(path))
 
-    def _load_scan_snapshot(self):
-        """Duas consultas por varredura, em vez de conexões por vídeo conhecido."""
+    def _load_scan_snapshot(self):        
         prefix = str(self.source).rstrip('\\/') + os.sep
         escaped_prefix = prefix.replace('!', '!!').replace('%', '!%').replace('_', '!_') + '%'
         with core.db_connection() as db:
