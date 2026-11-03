@@ -1,4 +1,3 @@
-"""Interface de acompanhamento da fila automática de vídeos da EVA."""
 from __future__ import annotations
 
 import queue

@@ -1,8 +1,3 @@
-"""Identificadores e XML de cadastro, conforme o modelo Floripa fornecido.
-
-``smartware`` gera o layout video em ISO-8859-1; ``smartware_template`` permite
-adaptar o mapeamento da instalação. ``eva`` mantém o rascunho de conferência.
-"""
 from __future__ import annotations
 
 import math
